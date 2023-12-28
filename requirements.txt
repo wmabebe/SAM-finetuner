@@ -6,3 +6,7 @@ patchify
 matplotlib
 tifffile
 scipy
+pycocotools
+scikit-image
+torchvision
+fiftyone
