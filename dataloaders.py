@@ -49,7 +49,7 @@ class CocoDetection(data.Dataset):
         ann_ids = coco.getAnnIds(imgIds=img_id)
         target = coco.loadAnns(ann_ids)
 
-        print(f"\tLoading image:{img_id} \t target: {target}")
+        #print(f"\tLoading image:{img_id} \t target: {target}")
 
         path = coco.loadImgs(img_id)[0]['file_name']
 
@@ -57,8 +57,8 @@ class CocoDetection(data.Dataset):
         if self.transform is not None:
             img = self.transform(img)
 
-        # if self.target_transform is not None:
-        #     target = self.target_transform(target)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
 
         return img, target
 
