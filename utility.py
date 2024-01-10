@@ -171,3 +171,25 @@ def toBinaryMask(coco, annIds, input_image_size):
     # Add extra dimension for parity with train_img size [X * X * 3]
     train_mask = train_mask.reshape(input_image_size[0], input_image_size[1], 1)
     return train_mask
+
+def point_grid(image_size, n):
+    """
+    Generate a list of coordinates representing an nxn grid within the image's dimensions.
+
+    Args:
+    - image_size (tuple): Tuple representing the dimensions of the image (x, y).
+    - n (int): Number of points along each dimension for the grid.
+
+    Returns:
+    - List of coordinates [(x1, y1), (x2, y2), ..., (xn, yn)].
+    """
+    x_max, y_max = image_size
+
+    # Calculate the step size between points
+    step_x = x_max / (n + 1)
+    step_y = y_max / (n + 1)
+
+    # Generate the grid of coordinates
+    grid = [[int(i * step_x), int(j * step_y)] for i in range(1, n + 1) for j in range(1, n + 1)]
+
+    return grid
