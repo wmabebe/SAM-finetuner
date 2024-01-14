@@ -5,4 +5,4 @@ RaFFM-main/
 *.out
 *.pth
 *.jpg
-*.__pyc__
+*.pyc

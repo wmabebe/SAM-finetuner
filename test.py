@@ -20,9 +20,9 @@ def get_transform():
     custom_transforms.append(transforms.ToTensor())
     return transforms.Compose(custom_transforms)
 
-LIMIT = 5000
+LIMIT = 1000
 N = 8
-MODEL = 'MODEL'
+MODEL = 'SUBMODEL'
 
 # path to your own data and coco file
 data_dir = 'datasets/coco/val2017'
@@ -69,6 +69,7 @@ generator = pipeline("mask-generation", model=submodel if MODEL == 'SUBMODEL' el
 
 
 final_ious, final_precs, final_recs, final_f1s = [], [], [], []
+cats_mean, cats_max = {}, {}
 
 # Iterate till (LIMIT) through the DataLoader
 for idx, (images, targets) in enumerate(data_loader):
@@ -91,41 +92,55 @@ for idx, (images, targets) in enumerate(data_loader):
     
     #Grab annotation ids associated with this image
     annIds = []
+    gt_areas = 0
     for target in targets:
+        gt_areas += target['area'].item()
         annIds.append(target['id'].item()) 
     anns = coco.loadAnns(annIds)
     
-    gt_areas, avg_iou, avg_pre, avg_rec, avg_f1 = 0, 0, 0, 0, 0
+    avg_iou, avg_pre, avg_rec, avg_f1 = 0, 0, 0, 0
 
     #For each annotation, compute metrics against every mask
     for ann in anns:
         area_gt = ann['area']
-        gt_areas += area_gt
+        cat = ann['category_id']
+        if cat not in cats_mean.keys():
+           cats_mean[cat] = []
+        if cat not in cats_max.keys():
+            cats_max[cat] = []
         mask_gt = coco.annToMask(ann)
         mask_gt[mask_gt >= 0.5] = 1
         mask_gt[mask_gt < 0.5] = 0
         ious, recs, precs, f1s = [], [], [], []
         for mask in masks:
-            # mask_pred = mask[0, 0, :, :]
-            # mask_pred = mask_pred.numpy()
             iou, rec, prec, f1 = calculate_metrics(mask,mask_gt)
-            #Only print values with iou>50%
             if iou > 0:
                 ious.append(iou)
                 recs.append(rec)
                 precs.append(prec)
                 f1s.append(f1)
+        
+        #Mean of predictions for a ground truth
         mean_iou = sum(ious) / len(ious) if ious else 0
         mean_rec = sum(recs) / len(recs) if recs else 0
         mean_pre = sum(precs) / len(precs) if precs else 0
         mean_f1 = sum(f1s) / len(f1s) if f1s else 0
         
+        #Best matching for ground truth
+        max_iou = max(ious)if ious else 0
+        max_rec = max(recs) if recs else 0
+        max_pre = max(precs) if precs else 0
+        max_f1 = max(f1s) if f1s else 0
+        
+        cats_mean[cat].append((mean_iou, mean_rec, mean_pre, mean_f1))
+        cats_max[cat].append((max_iou, max_rec, max_pre, max_f1))
+        
         print(f'\tAnn_id: {ann["id"]:<20} Ann_area={round(area_gt, 4):<20} m_iou={round(mean_iou, 4):<20} m_rec={round(mean_rec, 4):<20} m_pre={round(mean_pre, 4):<20} m_f1={round(mean_f1,4):<20}')         
 
-        avg_iou += (area_gt / gt_areas) * mean_iou * 100
-        avg_pre += (area_gt / gt_areas) * mean_pre * 100
-        avg_rec += (area_gt / gt_areas) * mean_rec * 100
-        avg_f1 += (area_gt / gt_areas) * mean_f1 * 100
+        avg_iou += (1 / len(anns)) * mean_iou * 100
+        avg_pre += (1 / len(anns)) * mean_pre * 100
+        avg_rec += (1 / len(anns)) * mean_rec * 100
+        avg_f1 += (1 / len(anns)) * mean_f1 * 100
         
     print(f'\tSummary: Img_area={round(img_area, 4):<20} m_iou={round(avg_iou, 2):<20} m_rec={round(avg_rec, 2):<20} m_pre={round(avg_pre, 2):<20} m_f1={round(avg_f1,2):<20}')         
 
@@ -147,4 +162,28 @@ final_rec = sum(final_recs) / len(final_recs) if final_recs else 0
 final_pre = sum(final_precs) / len(final_precs) if final_precs else 0
 final_f1 = sum(final_f1s) / len(final_f1s) if final_f1s else 0
 
-print(f'\n\tFinal: model:{MODEL} Img_area={round(img_area, 4):<20} m_iou={round(final_iou, 2):<20} m_rec={round(final_rec, 2):<20} m_pre={round(final_pre, 2):<20} m_f1={round(final_f1,2):<20}')         
+print(f'\nFinal: model:{MODEL} Img_area={round(img_area, 4):<20} m_iou={round(final_iou, 2):<20} m_rec={round(final_rec, 2):<20} m_pre={round(final_pre, 2):<20} m_f1={round(final_f1,2):<20}')         
+
+cats_mean_avgs, cats_max_avgs = [], []
+
+print('Category mean performance')
+for cat_id, vals in cats_mean.items():
+    cat_name = coco.loadCats(cat_id)[0]["name"]
+    cat_iou, cat_rec, cat_pre, cat_f1 = tuple(map(lambda *x: sum(x) / len(x), *vals))
+    print(f'\t{cat_name:20}: m_iou={round(cat_iou, 2):<20} m_rec={round(cat_rec, 2):<20} m_pre={round(cat_pre, 2):<20} m_f1={round(cat_f1,2):<20}')
+    cats_mean_avgs.append((cat_iou, cat_rec, cat_pre, cat_f1))
+
+cat_iou_avg, cat_rec_avg, cat_pre_avg, cat_f1_avg = tuple(map(lambda *x: sum(x) / len(x), *cats_mean_avgs))
+
+print(f'\t{"Cat. Mean Average":20}: m_iou={round(cat_iou_avg * 100, 2):<20} m_rec={round(cat_rec_avg * 100, 2):<20} m_pre={round(cat_pre_avg * 100, 2):<20} m_f1={round(cat_f1_avg * 100,2):<20}')
+
+print('Category max performance')
+for cat_id, vals in cats_max.items():
+    cat_name = coco.loadCats(cat_id)[0]["name"]
+    cat_iou, cat_rec, cat_pre, cat_f1 = tuple(map(lambda *x: sum(x) / len(x), *vals))
+    print(f'\t{cat_name:20}: m_iou={round(cat_iou, 2):<20} m_rec={round(cat_rec, 2):<20} m_pre={round(cat_pre, 2):<20} m_f1={round(cat_f1,2):<20}')
+    cats_max_avgs.append((cat_iou, cat_rec, cat_pre, cat_f1))
+
+cat_iou_avg, cat_rec_avg, cat_pre_avg, cat_f1_avg = tuple(map(lambda *x: sum(x) / len(x), * cats_max_avgs))
+
+print(f'\t{"Cat. Max Average":20}: m_iou={round(cat_iou_avg * 100, 2):<20} m_rec={round(cat_rec_avg * 100, 2):<20} m_pre={round(cat_pre_avg * 100, 2):<20} m_f1={round(cat_f1_avg * 100,2):<20}')
