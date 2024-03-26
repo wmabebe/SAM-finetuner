@@ -1,10 +1,13 @@
 import os
-from transformers import SamModel, SamProcessor
+from transformers import SamModel, SamConfig, SamProcessor
 from raffm import RaFFM
 from torch.utils.data import DataLoader
 from torch.utils.data import Subset
 from utility import *
-from dataset import SA1BDataset
+from dataset import SA1BDataset, SAMDataset
+from torch.optim import Adam
+import monai
+from statistics import mean
 
 
 # Initialize the original SAM model and processor
@@ -21,76 +24,94 @@ raffm_model = RaFFM(original_model, elastic_config=elastic_config)
 submodel, params, config = raffm_model.random_resource_aware_model()
 submodel = submodel.to("cuda")  # Move submodel to GPU
 
-dataset = SA1BDataset("SA1B")
-train_dataset = Subset(dataset, indices=range(0, 256, 1))
-test_dataset = Subset(dataset, indices=range(256, 320, 1))
-train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-test_dataloader = DataLoader(test_dataset, batch_size=1)
+# dataset = SA1BDataset("SA1B")
+# train_dataset = Subset(dataset, indices=range(0, 256, 1))
+# test_dataset = Subset(dataset, indices=range(256, 320, 1))
+# train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+# test_dataloader = DataLoader(test_dataset, batch_size=1)
+
+# Create an instance of the SAMDataset
+train_dataset = load_dataset("datasets/mitochondria/training.tif", "datasets/mitochondria/training_groundtruth.tif")
+test_dataset = load_dataset("datasets/mitochondria/testing.tif", "datasets/mitochondria/testing_groundtruth.tif")
+train_dataset = SAMDataset(dataset=train_dataset, processor=processor)
+test_dataset = SAMDataset(dataset=test_dataset, processor=processor)
+
+# Create a DataLoader instance for the training dataset
+train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, drop_last=False)
+test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, drop_last=True)
 
 print(f'trainloader : {len(train_dataloader)}')
 print(f'trainloader : {len(test_dataloader)}')
 
 # Calculate IoUs and average IoU before training
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-image_ious_original, average_iou_original = inference(original_model, test_dataloader, device)
-print('IoUs for original:')
-for iou in image_ious_original:
-    print(iou)
-print(f'Average IoU original: {average_iou_original:.4f}')
+miou = test(submodel,test_dataloader,disable_verbose=True)
+print(f'pre-train mIoU : {miou}')
 
-# image_ious_before, average_iou_before = inference(submodel, test_dataloader)
-# print('IoUs for each image before training submodel:')
-# for iou in image_ious_before:
-#     print(iou)
-# print(f'Average IoU before training submodel: {average_iou_before:.4f}')
-
-# Freeze vision_encoder and prompt_encoder in the submodel
+# make sure we only compute gradients for mask decoder
 for name, param in submodel.named_parameters():
-    if name.startswith("mask_decoder") or name.startswith("prompt_encoder"):
-        param.requires_grad_(False)
+  if name.startswith("vision_encoder") or name.startswith("prompt_encoder"):
+    param.requires_grad_(False)
 
-# Training loop
-# optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, submodel.parameters()), lr=1e-8)
-# num_epochs = 100
 
-# for epoch in range(num_epochs):
-#     torch.cuda.empty_cache()
-#     submodel.train()
-#     running_loss = 0.0
+# Initialize the optimizer and the loss function
+optimizer = Adam(submodel.mask_decoder.parameters(), lr=1e-5, weight_decay=0)
+#Try DiceFocalLoss, FocalLoss, DiceCELoss
+seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
-#     for images, masks in train_dataloader:
-#         images = images.to("cuda")
-#         masks = masks.to("cuda")
 
-#         optimizer.zero_grad()
+#Training loop
+num_epochs = 5
 
-#         # Forward pass
-#         outputs = submodel(images)['pred_masks']
-#         pred_masks = outputs.squeeze(1)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+submodel.to(device)
 
-#         # Select the appropriate channel and squeeze the channel dimension
-#         pred_masks = pred_masks[:, 0, :, :].unsqueeze(1)
+submodel.train()
+for epoch in range(num_epochs):
+    epoch_losses = []
+    for batch in tqdm(train_dataloader, disable=True):
+      # forward pass
+      outputs = submodel(pixel_values=batch["pixel_values"].to(device),
+                      input_boxes=batch["input_boxes"].to(device),
+                      multimask_output=False)
 
-#         # Resize predicted masks to match target masks
-#         pred_masks_resized = torch.nn.functional.interpolate(pred_masks, size=(256, 256), mode='bilinear', align_corners=False)
+      # compute loss
+      predicted_masks = outputs.pred_masks.squeeze(1)
+      ground_truth_masks = batch["ground_truth_mask"].float().to(device)
+      loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
 
-#         # Compute the loss
-#         loss_focal = focal_loss(pred_masks_resized, masks)
-#         loss_dice = dice_loss(pred_masks_resized, masks)
-#         loss = loss_focal + loss_dice
+      # backward pass (compute gradients of parameters w.r.t. loss)
+      optimizer.zero_grad()
+      loss.backward()
 
-#         # Backward pass and optimize
-#         loss.backward()
-#         optimizer.step()
+      # optimize
+      optimizer.step()
+      epoch_losses.append(loss.item())
 
-#         running_loss += loss.item()
+    print(f'EPOCH: {epoch}')
+    print(f'Mean loss: {mean(epoch_losses)}')
 
-#     epoch_loss = running_loss / len(train_dataloader)
-#     print(f'Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}')
+# Save the model's state dictionary to a file
+torch.save(submodel.state_dict(), "models/mito_submodel_checkpoint.pth")
 
-# # Calculate IoUs and average IoU after training
-# image_ious_after, average_iou_after = inference(submodel, test_dataloader)
-# print('IoUs for each image after training:')
-# for iou in image_ious_after:
-#     print(iou)
-# print(f'Average IoU after training: {average_iou_after:.4f}')
+"""**Inference**"""
+
+# Load the model configuration
+model_config = SamConfig.from_pretrained("facebook/sam-vit-base")
+processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+
+# Create an instance of the model architecture with the loaded configuration
+my_mito_submodel = SamModel(config=model_config)
+#Update the model by loading the weights from saved file.
+my_mito_submodel.load_state_dict(torch.load("models/mito_submodel_checkpoint.pth"))
+
+# set the device to cuda if available, otherwise use cpu
+device = "cuda" if torch.cuda.is_available() else "cpu"
+my_mito_submodel.to(device)
+
+
+#Testing
+
+miou = test(my_mito_submodel,test_dataloader,disable_verbose=True)
+print(f'post-train mIoU : {miou}')
+

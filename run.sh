@@ -13,8 +13,8 @@ module load cuda/11.7
 module load gcc/9.1.0
 
 
-#python trainer.py
+python trainer.py
 
 #python hugging.py
 
-python3 finetune.py
+#python3 finetune.py

@@ -1,7 +1,8 @@
+import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
-from utility import get_image_info, get_ground_truth_masks
+from utility import get_image_info, get_ground_truth_masks, get_bounding_box
 
 class SA1BDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_directory):
@@ -25,3 +26,40 @@ class SA1BDataset(torch.utils.data.Dataset):
         mask = transforms.functional.resize(mask, (256, 256), interpolation=transforms.InterpolationMode.NEAREST)  # Resize mask
 
         return image, mask
+    
+class SAMDataset(torch.utils.data.Dataset):
+  """
+  This class is used to create a dataset that serves input images and masks.
+  It takes a dataset and a processor as input and overrides the __len__ and __getitem__ methods of the Dataset class.
+  """
+  def __init__(self, dataset, processor):
+    self.dataset = dataset
+    self.processor = processor
+
+  def __len__(self):
+    return len(self.dataset)
+
+  def __getitem__(self, idx):
+    item = self.dataset[idx]
+    image = item["image"]
+    ground_truth_mask = np.array(item["label"])
+
+    # get bounding box prompt
+    prompt = get_bounding_box(ground_truth_mask)
+
+    # Convert the image to grayscale (if it's not already in grayscale)
+    image = image.convert("L")
+
+    # Add a channel dimension
+    image = image.convert("RGB")
+
+    # prepare image and prompt for the model
+    inputs = self.processor(image, input_boxes=[[prompt]], return_tensors="pt")
+
+    # remove batch dimension which the processor adds by default
+    inputs = {k:v.squeeze(0) for k,v in inputs.items()}
+
+    # add ground truth segmentation
+    inputs["ground_truth_mask"] = ground_truth_mask
+
+    return inputs

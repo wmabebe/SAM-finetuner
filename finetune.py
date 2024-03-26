@@ -48,230 +48,17 @@ https://github.com/NielsRogge/Transformers-Tutorials/blob/master/SAM/Fine_tune_S
 """
 
 
-
-import numpy as np
-import matplotlib.pyplot as plt
-import tifffile
-import os
-from patchify import patchify  #Only to handle large images
-import random
-from scipy import ndimage
 import torch
-from datasets import Dataset as DatasetX
-from PIL import Image
 from torch.optim import Adam
-from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 import monai
 from tqdm import tqdm
 from statistics import mean
-from torch.nn.functional import threshold, normalize
 from transformers import SamModel, SamConfig, SamProcessor
-
-class SAMDataset(Dataset):
-  """
-  This class is used to create a dataset that serves input images and masks.
-  It takes a dataset and a processor as input and overrides the __len__ and __getitem__ methods of the Dataset class.
-  """
-  def __init__(self, dataset, processor):
-    self.dataset = dataset
-    self.processor = processor
-
-  def __len__(self):
-    return len(self.dataset)
-
-  def __getitem__(self, idx):
-    item = self.dataset[idx]
-    image = item["image"]
-    ground_truth_mask = np.array(item["label"])
-
-    # get bounding box prompt
-    prompt = get_bounding_box(ground_truth_mask)
-
-    # Convert the image to grayscale (if it's not already in grayscale)
-    image = image.convert("L")
-
-    # Add a channel dimension
-    image = image.convert("RGB")
-
-    # prepare image and prompt for the model
-    inputs = self.processor(image, input_boxes=[[prompt]], return_tensors="pt")
-
-    # remove batch dimension which the processor adds by default
-    inputs = {k:v.squeeze(0) for k,v in inputs.items()}
-
-    # add ground truth segmentation
-    inputs["ground_truth_mask"] = ground_truth_mask
-
-    return inputs
-
-# Load tiff stack images and masks
-def load_dataset(data_path, label_path, patch_size=256, step=256):
-    
-    #165 large images as tiff image stack
-    large_images = tifffile.imread(data_path)
-    large_masks = tifffile.imread(label_path)
-
-    large_images.shape
-
-    """Now. let us divide these large images into smaller patches for training. We can use patchify or write custom code."""
-    all_img_patches = []
-    for img in range(large_images.shape[0]):
-        large_image = large_images[img]
-        patches_img = patchify(large_image, (patch_size, patch_size), step=step)  #Step=256 for 256 patches means no overlap
-
-        for i in range(patches_img.shape[0]):
-            for j in range(patches_img.shape[1]):
-
-                single_patch_img = patches_img[i,j,:,:]
-                all_img_patches.append(single_patch_img)
-
-    images = np.array(all_img_patches)
-
-    #Let us do the same for masks
-    all_mask_patches = []
-    for img in range(large_masks.shape[0]):
-        large_mask = large_masks[img]
-        patches_mask = patchify(large_mask, (patch_size, patch_size), step=step)  #Step=256 for 256 patches means no overlap
-
-        for i in range(patches_mask.shape[0]):
-            for j in range(patches_mask.shape[1]):
-
-                single_patch_mask = patches_mask[i,j,:,:]
-                single_patch_mask = (single_patch_mask / 255.).astype(np.uint8)
-                all_mask_patches.append(single_patch_mask)
-
-    masks = np.array(all_mask_patches)
-
-    print("images.shape:",images.shape)
-    print("masks.shape:",masks.shape)
-
-    """Now, let us delete empty masks as they may cause issues later on during training. If a batch contains empty masks then the loss function will throw an error as it may not know how to handle empty tensors."""
-
-    # Create a list to store the indices of non-empty masks
-    valid_indices = [i for i, mask in enumerate(masks) if mask.max() != 0]
-    # Filter the image and mask arrays to keep only the non-empty pairs
-    filtered_images = images[valid_indices]
-    filtered_masks = masks[valid_indices]
-    print("Image shape:", filtered_images.shape)  # e.g., (num_frames, height, width, num_channels)
-    print("Mask shape:", filtered_masks.shape)
-
-    """Let us create a 'dataset' that serves us input images and masks for the rest of our journey."""
+from utility import load_dataset, test
+from dataset import SAMDataset
 
 
-
-    # Convert the NumPy arrays to Pillow images and store them in a dictionary
-    dataset_dict = {
-        "image": [Image.fromarray(img) for img in filtered_images],
-        "label": [Image.fromarray(mask) for mask in filtered_masks],
-    }
-
-    # Create the dataset using the datasets.Dataset class
-    dataset = DatasetX.from_dict(dataset_dict)
-
-    return dataset
-
-
-"""Get bounding boxes from masks. You can get here directly if you are working with coco style annotations where bounding boxes are captured in a JSON file."""
-
-#Get bounding boxes from mask.
-def get_bounding_box(ground_truth_map):
-  # get bounding box from mask
-  y_indices, x_indices = np.where(ground_truth_map > 0)
-  x_min, x_max = np.min(x_indices), np.max(x_indices)
-  y_min, y_max = np.min(y_indices), np.max(y_indices)
-  # add perturbation to bounding box coordinates
-  H, W = ground_truth_map.shape
-  x_min = max(0, x_min - np.random.randint(0, 20))
-  x_max = min(W, x_max + np.random.randint(0, 20))
-  y_min = max(0, y_min - np.random.randint(0, 20))
-  y_max = min(H, y_max + np.random.randint(0, 20))
-  bbox = [x_min, y_min, x_max, y_max]
-
-  return bbox
-
-def compute_iou(predicted_masks, gt_masks):
-
-    # Convert predicted and ground truth masks to boolean tensors
-    predicted_masks_bool = predicted_masks.bool()
-    gt_masks_bool = gt_masks.bool()
-
-    # Compute intersection and union
-    intersection = (predicted_masks_bool & gt_masks_bool).sum(dim=(1, 2)).float()
-    union = (predicted_masks_bool | gt_masks_bool).sum(dim=(1, 2)).float()
-
-    # Compute IoU
-    iou = intersection / (union + 1e-10)  # Adding epsilon to avoid division by zero
-
-    iou = torch.mean(iou)
-
-    return round(iou.item(), 4)
-  
-def get_prompt_grid(size=10, batch_size=1):
-    # Define the size of your array
-   array_size = 256
-
-    # Define the size of your grid
-   grid_size = size
-
-    # Generate the grid points
-   x = np.linspace(0, array_size-1, grid_size)
-   y = np.linspace(0, array_size-1, grid_size)
-
-    # Generate a grid of coordinates
-   xv, yv = np.meshgrid(x, y)
-
-    # Convert the numpy arrays to lists
-   xv_list = xv.tolist()
-   yv_list = yv.tolist()
-
-    # Combine the x and y coordinates into a list of list of lists
-   input_points = [[[int(x), int(y)] for x, y in zip(x_row, y_row)] for x_row, y_row in zip(xv_list, yv_list)]
-   input_points = torch.tensor(input_points).view(1, 1, grid_size*grid_size, 2)
-
-   input_points = input_points.repeat(batch_size, 1, 1, 1)
-   
-   return input_points
-
-
-def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda'):
-    mIoU = []
-    count = 0
-    input_points = get_prompt_grid(grid_size,batch_size)
-    print(f'input_points :  {input_points.shape}')
-    model.eval()
-    model = model.to(device)
-    for batch in tqdm(dataloader):
-
-        # inputs = processor(batch["pixel_values"], input_points=input_points, return_tensors="pt")
-        # inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        # forward pass
-        with torch.no_grad():
-          outputs = model(pixel_values=batch["pixel_values"].to(device),
-                        input_points=input_points.to(device),
-                        multimask_output=False)
-          #outputs = my_mito_model(**inputs, multimask_output=False)
-
-        # compute iou
-        predicted_masks = outputs.pred_masks.squeeze(1)
-        ground_truth_masks = batch["ground_truth_mask"].float().to(device)
-
-
-        # apply sigmoid
-        single_patch_prob = torch.sigmoid(outputs.pred_masks.squeeze(1))
-        # convert soft mask to hard mask
-        single_patch_prob = single_patch_prob.squeeze()
-        predicted_masks_binary = (single_patch_prob > 0.5)
-
-
-        mIoU.append(compute_iou(predicted_masks_binary,ground_truth_masks))
-
-        if count == size:
-          break
-
-        count += 1
-    return round(sum(mIoU) / len(mIoU), 4) 
 
 
 # Initialize the processor
@@ -324,7 +111,7 @@ model.to(device)
 model.train()
 for epoch in range(num_epochs):
     epoch_losses = []
-    for batch in tqdm(train_dataloader):
+    for batch in tqdm(train_dataloader, disable=True):
       # forward pass
       outputs = model(pixel_values=batch["pixel_values"].to(device),
                       input_boxes=batch["input_boxes"].to(device),
