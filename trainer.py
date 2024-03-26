@@ -36,7 +36,13 @@ test_dataset = load_dataset("datasets/mitochondria/testing.tif", "datasets/mitoc
 train_dataset = SAMDataset(dataset=train_dataset, processor=processor)
 test_dataset = SAMDataset(dataset=test_dataset, processor=processor)
 
-# Create a DataLoader instance for the training dataset
+# Apply subset for shoter training
+# subset_dataset = Subset(train_dataset, indices=range(20))
+# train_dataloader = DataLoader(subset_dataset, batch_size=2, shuffle=False)
+# subset_dataset = Subset(test_dataset, indices=range(20))
+# test_dataloader = DataLoader(subset_dataset, batch_size=2, shuffle=True)
+
+# # Create a DataLoader instance for the training dataset
 train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, drop_last=False)
 test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, drop_last=True)
 
@@ -45,7 +51,7 @@ print(f'trainloader : {len(test_dataloader)}')
 
 # Calculate IoUs and average IoU before training
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-miou = test(submodel,test_dataloader,disable_verbose=True)
+miou = test(submodel,test_dataloader,disable_verbose=False)
 print(f'pre-train mIoU : {miou}')
 
 # make sure we only compute gradients for mask decoder
@@ -61,7 +67,7 @@ seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='m
 
 
 #Training loop
-num_epochs = 5
+num_epochs = 10
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 submodel.to(device)
@@ -69,7 +75,7 @@ submodel.to(device)
 submodel.train()
 for epoch in range(num_epochs):
     epoch_losses = []
-    for batch in tqdm(train_dataloader, disable=True):
+    for batch in tqdm(train_dataloader, disable=False):
       # forward pass
       outputs = submodel(pixel_values=batch["pixel_values"].to(device),
                       input_boxes=batch["input_boxes"].to(device),
@@ -93,15 +99,16 @@ for epoch in range(num_epochs):
 
 # Save the model's state dictionary to a file
 torch.save(submodel.state_dict(), "models/mito_submodel_checkpoint.pth")
+torch.save(config,"models/mito_submodel_config.pth")
 
 """**Inference**"""
 
 # Load the model configuration
-model_config = SamConfig.from_pretrained("facebook/sam-vit-base")
+config = torch.load("models/mito_submodel_config.pth")
 processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
 
 # Create an instance of the model architecture with the loaded configuration
-my_mito_submodel = SamModel(config=model_config)
+my_mito_submodel, total_params = raffm_model.resource_aware_model(config)
 #Update the model by loading the weights from saved file.
 my_mito_submodel.load_state_dict(torch.load("models/mito_submodel_checkpoint.pth"))
 
@@ -112,6 +119,6 @@ my_mito_submodel.to(device)
 
 #Testing
 
-miou = test(my_mito_submodel,test_dataloader,disable_verbose=True)
+miou = test(my_mito_submodel,test_dataloader,disable_verbose=False)
 print(f'post-train mIoU : {miou}')
 
