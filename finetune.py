@@ -56,124 +56,17 @@ import os
 from patchify import patchify  #Only to handle large images
 import random
 from scipy import ndimage
-
-
-# Load tiff stack images and masks
-
-#165 large images as tiff image stack
-large_images = tifffile.imread("datasets/mitochondria/training.tif")
-large_masks = tifffile.imread("datasets/mitochondria/training_groundtruth.tif")
-
-large_images.shape
-
-"""Now. let us divide these large images into smaller patches for training. We can use patchify or write custom code."""
-
-#Desired patch size for smaller images and step size.
-patch_size = 256
-step = 256
-
-all_img_patches = []
-for img in range(large_images.shape[0]):
-    large_image = large_images[img]
-    patches_img = patchify(large_image, (patch_size, patch_size), step=step)  #Step=256 for 256 patches means no overlap
-
-    for i in range(patches_img.shape[0]):
-        for j in range(patches_img.shape[1]):
-
-            single_patch_img = patches_img[i,j,:,:]
-            all_img_patches.append(single_patch_img)
-
-images = np.array(all_img_patches)
-
-#Let us do the same for masks
-all_mask_patches = []
-for img in range(large_masks.shape[0]):
-    large_mask = large_masks[img]
-    patches_mask = patchify(large_mask, (patch_size, patch_size), step=step)  #Step=256 for 256 patches means no overlap
-
-    for i in range(patches_mask.shape[0]):
-        for j in range(patches_mask.shape[1]):
-
-            single_patch_mask = patches_mask[i,j,:,:]
-            single_patch_mask = (single_patch_mask / 255.).astype(np.uint8)
-            all_mask_patches.append(single_patch_mask)
-
-masks = np.array(all_mask_patches)
-
-print("images.shape:",images.shape)
-print("masks.shape:",masks.shape)
-
-"""Now, let us delete empty masks as they may cause issues later on during training. If a batch contains empty masks then the loss function will throw an error as it may not know how to handle empty tensors."""
-
-# Create a list to store the indices of non-empty masks
-valid_indices = [i for i, mask in enumerate(masks) if mask.max() != 0]
-# Filter the image and mask arrays to keep only the non-empty pairs
-filtered_images = images[valid_indices]
-filtered_masks = masks[valid_indices]
-print("Image shape:", filtered_images.shape)  # e.g., (num_frames, height, width, num_channels)
-print("Mask shape:", filtered_masks.shape)
-
-"""Let us create a 'dataset' that serves us input images and masks for the rest of our journey."""
-
-from datasets import Dataset
+import torch
+from datasets import Dataset as DatasetX
 from PIL import Image
-
-# Convert the NumPy arrays to Pillow images and store them in a dictionary
-dataset_dict = {
-    "image": [Image.fromarray(img) for img in filtered_images],
-    "label": [Image.fromarray(mask) for mask in filtered_masks],
-}
-
-# Create the dataset using the datasets.Dataset class
-dataset = Dataset.from_dict(dataset_dict)
-
-dataset
-
-"""Let us make sure out images and masks (labels) are loading appropriately"""
-
-img_num = random.randint(0, filtered_images.shape[0]-1)
-example_image = dataset[img_num]["image"]
-example_mask = dataset[img_num]["label"]
-
-fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-
-# Plot the first image on the left
-axes[0].imshow(np.array(example_image), cmap='gray')  # Assuming the first image is grayscale
-axes[0].set_title("Image")
-
-# Plot the second image on the right
-axes[1].imshow(example_mask, cmap='gray')  # Assuming the second image is grayscale
-axes[1].set_title("Mask")
-
-# Hide axis ticks and labels
-for ax in axes:
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_xticklabels([])
-    ax.set_yticklabels([])
-
-# Display the images side by side
-plt.show()
-
-"""Get bounding boxes from masks. You can get here directly if you are working with coco style annotations where bounding boxes are captured in a JSON file."""
-
-#Get bounding boxes from mask.
-def get_bounding_box(ground_truth_map):
-  # get bounding box from mask
-  y_indices, x_indices = np.where(ground_truth_map > 0)
-  x_min, x_max = np.min(x_indices), np.max(x_indices)
-  y_min, y_max = np.min(y_indices), np.max(y_indices)
-  # add perturbation to bounding box coordinates
-  H, W = ground_truth_map.shape
-  x_min = max(0, x_min - np.random.randint(0, 20))
-  x_max = min(W, x_max + np.random.randint(0, 20))
-  y_min = max(0, y_min - np.random.randint(0, 20))
-  y_max = min(H, y_max + np.random.randint(0, 20))
-  bbox = [x_min, y_min, x_max, y_max]
-
-  return bbox
-
+from torch.optim import Adam
 from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+import monai
+from tqdm import tqdm
+from statistics import mean
+from torch.nn.functional import threshold, normalize
+from transformers import SamModel, SamConfig, SamProcessor
 
 class SAMDataset(Dataset):
   """
@@ -195,6 +88,12 @@ class SAMDataset(Dataset):
     # get bounding box prompt
     prompt = get_bounding_box(ground_truth_mask)
 
+    # Convert the image to grayscale (if it's not already in grayscale)
+    image = image.convert("L")
+
+    # Add a channel dimension
+    image = image.convert("RGB")
+
     # prepare image and prompt for the model
     inputs = self.processor(image, input_boxes=[[prompt]], return_tensors="pt")
 
@@ -206,20 +105,191 @@ class SAMDataset(Dataset):
 
     return inputs
 
+# Load tiff stack images and masks
+def load_dataset(data_path, label_path, patch_size=256, step=256):
+    
+    #165 large images as tiff image stack
+    large_images = tifffile.imread(data_path)
+    large_masks = tifffile.imread(label_path)
+
+    large_images.shape
+
+    """Now. let us divide these large images into smaller patches for training. We can use patchify or write custom code."""
+    all_img_patches = []
+    for img in range(large_images.shape[0]):
+        large_image = large_images[img]
+        patches_img = patchify(large_image, (patch_size, patch_size), step=step)  #Step=256 for 256 patches means no overlap
+
+        for i in range(patches_img.shape[0]):
+            for j in range(patches_img.shape[1]):
+
+                single_patch_img = patches_img[i,j,:,:]
+                all_img_patches.append(single_patch_img)
+
+    images = np.array(all_img_patches)
+
+    #Let us do the same for masks
+    all_mask_patches = []
+    for img in range(large_masks.shape[0]):
+        large_mask = large_masks[img]
+        patches_mask = patchify(large_mask, (patch_size, patch_size), step=step)  #Step=256 for 256 patches means no overlap
+
+        for i in range(patches_mask.shape[0]):
+            for j in range(patches_mask.shape[1]):
+
+                single_patch_mask = patches_mask[i,j,:,:]
+                single_patch_mask = (single_patch_mask / 255.).astype(np.uint8)
+                all_mask_patches.append(single_patch_mask)
+
+    masks = np.array(all_mask_patches)
+
+    print("images.shape:",images.shape)
+    print("masks.shape:",masks.shape)
+
+    """Now, let us delete empty masks as they may cause issues later on during training. If a batch contains empty masks then the loss function will throw an error as it may not know how to handle empty tensors."""
+
+    # Create a list to store the indices of non-empty masks
+    valid_indices = [i for i, mask in enumerate(masks) if mask.max() != 0]
+    # Filter the image and mask arrays to keep only the non-empty pairs
+    filtered_images = images[valid_indices]
+    filtered_masks = masks[valid_indices]
+    print("Image shape:", filtered_images.shape)  # e.g., (num_frames, height, width, num_channels)
+    print("Mask shape:", filtered_masks.shape)
+
+    """Let us create a 'dataset' that serves us input images and masks for the rest of our journey."""
+
+
+
+    # Convert the NumPy arrays to Pillow images and store them in a dictionary
+    dataset_dict = {
+        "image": [Image.fromarray(img) for img in filtered_images],
+        "label": [Image.fromarray(mask) for mask in filtered_masks],
+    }
+
+    # Create the dataset using the datasets.Dataset class
+    dataset = DatasetX.from_dict(dataset_dict)
+
+    return dataset
+
+
+"""Get bounding boxes from masks. You can get here directly if you are working with coco style annotations where bounding boxes are captured in a JSON file."""
+
+#Get bounding boxes from mask.
+def get_bounding_box(ground_truth_map):
+  # get bounding box from mask
+  y_indices, x_indices = np.where(ground_truth_map > 0)
+  x_min, x_max = np.min(x_indices), np.max(x_indices)
+  y_min, y_max = np.min(y_indices), np.max(y_indices)
+  # add perturbation to bounding box coordinates
+  H, W = ground_truth_map.shape
+  x_min = max(0, x_min - np.random.randint(0, 20))
+  x_max = min(W, x_max + np.random.randint(0, 20))
+  y_min = max(0, y_min - np.random.randint(0, 20))
+  y_max = min(H, y_max + np.random.randint(0, 20))
+  bbox = [x_min, y_min, x_max, y_max]
+
+  return bbox
+
+def compute_iou(predicted_masks, gt_masks):
+
+    # Convert predicted and ground truth masks to boolean tensors
+    predicted_masks_bool = predicted_masks.bool()
+    gt_masks_bool = gt_masks.bool()
+
+    # Compute intersection and union
+    intersection = (predicted_masks_bool & gt_masks_bool).sum(dim=(1, 2)).float()
+    union = (predicted_masks_bool | gt_masks_bool).sum(dim=(1, 2)).float()
+
+    # Compute IoU
+    iou = intersection / (union + 1e-10)  # Adding epsilon to avoid division by zero
+
+    iou = torch.mean(iou)
+
+    return round(iou.item(), 4)
+  
+def get_prompt_grid(size=10, batch_size=1):
+    # Define the size of your array
+   array_size = 256
+
+    # Define the size of your grid
+   grid_size = size
+
+    # Generate the grid points
+   x = np.linspace(0, array_size-1, grid_size)
+   y = np.linspace(0, array_size-1, grid_size)
+
+    # Generate a grid of coordinates
+   xv, yv = np.meshgrid(x, y)
+
+    # Convert the numpy arrays to lists
+   xv_list = xv.tolist()
+   yv_list = yv.tolist()
+
+    # Combine the x and y coordinates into a list of list of lists
+   input_points = [[[int(x), int(y)] for x, y in zip(x_row, y_row)] for x_row, y_row in zip(xv_list, yv_list)]
+   input_points = torch.tensor(input_points).view(1, 1, grid_size*grid_size, 2)
+
+   input_points = input_points.repeat(batch_size, 1, 1, 1)
+   
+   return input_points
+
+
+def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda'):
+    mIoU = []
+    count = 0
+    input_points = get_prompt_grid(grid_size,batch_size)
+    print(f'input_points :  {input_points.shape}')
+    model.eval()
+    model = model.to(device)
+    for batch in tqdm(dataloader):
+
+        # inputs = processor(batch["pixel_values"], input_points=input_points, return_tensors="pt")
+        # inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        # forward pass
+        with torch.no_grad():
+          outputs = model(pixel_values=batch["pixel_values"].to(device),
+                        input_points=input_points.to(device),
+                        multimask_output=False)
+          #outputs = my_mito_model(**inputs, multimask_output=False)
+
+        # compute iou
+        predicted_masks = outputs.pred_masks.squeeze(1)
+        ground_truth_masks = batch["ground_truth_mask"].float().to(device)
+
+
+        # apply sigmoid
+        single_patch_prob = torch.sigmoid(outputs.pred_masks.squeeze(1))
+        # convert soft mask to hard mask
+        single_patch_prob = single_patch_prob.squeeze()
+        predicted_masks_binary = (single_patch_prob > 0.5)
+
+
+        mIoU.append(compute_iou(predicted_masks_binary,ground_truth_masks))
+
+        if count == size:
+          break
+
+        count += 1
+    return round(sum(mIoU) / len(mIoU), 4) 
+
+
 # Initialize the processor
-from transformers import SamProcessor
 processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
 
 # Create an instance of the SAMDataset
-train_dataset = SAMDataset(dataset=dataset, processor=processor)
+train_dataset = load_dataset("datasets/mitochondria/training.tif", "datasets/mitochondria/training_groundtruth.tif")
+test_dataset = load_dataset("datasets/mitochondria/testing.tif", "datasets/mitochondria/testing_groundtruth.tif")
+train_dataset = SAMDataset(dataset=train_dataset, processor=processor)
+test_dataset = SAMDataset(dataset=test_dataset, processor=processor)
 
 example = train_dataset[0]
 for k,v in example.items():
   print(k,v.shape)
 
 # Create a DataLoader instance for the training dataset
-from torch.utils.data import DataLoader
 train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, drop_last=False)
+test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, drop_last=True)
 
 batch = next(iter(train_dataloader))
 for k,v in batch.items():
@@ -228,25 +298,22 @@ for k,v in batch.items():
 batch["ground_truth_mask"].shape
 
 # Load the model
-from transformers import SamModel
 model = SamModel.from_pretrained("facebook/sam-vit-base")
+
+miou = test(model,test_dataloader)
+print(f'pre-train mIoU : {miou}')
 
 # make sure we only compute gradients for mask decoder
 for name, param in model.named_parameters():
   if name.startswith("vision_encoder") or name.startswith("prompt_encoder"):
     param.requires_grad_(False)
 
-from torch.optim import Adam
-import monai
+
 # Initialize the optimizer and the loss function
 optimizer = Adam(model.mask_decoder.parameters(), lr=1e-5, weight_decay=0)
 #Try DiceFocalLoss, FocalLoss, DiceCELoss
 seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
-from tqdm import tqdm
-from statistics import mean
-import torch
-from torch.nn.functional import threshold, normalize
 
 #Training loop
 num_epochs = 5
@@ -284,9 +351,6 @@ torch.save(model.state_dict(), "models/mito_model_checkpoint.pth")
 
 """**Inference**"""
 
-from transformers import SamModel, SamConfig, SamProcessor
-import torch
-
 # Load the model configuration
 model_config = SamConfig.from_pretrained("facebook/sam-vit-base")
 processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
@@ -300,179 +364,9 @@ my_mito_model.load_state_dict(torch.load("models/mito_model_checkpoint.pth"))
 device = "cuda" if torch.cuda.is_available() else "cpu"
 my_mito_model.to(device)
 
-import numpy as np
-import random
-import torch
-import matplotlib.pyplot as plt
 
-# let's take a random training example
-idx = random.randint(0, filtered_images.shape[0]-1)
+#Testing
 
-# load image
-test_image = dataset[idx]["image"]
+miou = test(my_mito_model,test_dataloader)
+print(f'post-train mIoU : {miou}')
 
-# get box prompt based on ground truth segmentation map
-ground_truth_mask = np.array(dataset[idx]["label"])
-prompt = get_bounding_box(ground_truth_mask)
-
-# prepare image + box prompt for the model
-inputs = processor(test_image, input_boxes=[[prompt]], return_tensors="pt")
-
-# Move the input tensor to the GPU if it's not already there
-inputs = {k: v.to(device) for k, v in inputs.items()}
-
-my_mito_model.eval()
-
-# forward pass
-with torch.no_grad():
-    outputs = my_mito_model(**inputs, multimask_output=False)
-
-# apply sigmoid
-medsam_seg_prob = torch.sigmoid(outputs.pred_masks.squeeze(1))
-# convert soft mask to hard mask
-medsam_seg_prob = medsam_seg_prob.cpu().numpy().squeeze()
-medsam_seg = (medsam_seg_prob > 0.5).astype(np.uint8)
-
-
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-# Plot the first image on the left
-axes[0].imshow(np.array(test_image), cmap='gray')  # Assuming the first image is grayscale
-axes[0].set_title("Image")
-
-# Plot the second image on the right
-axes[1].imshow(medsam_seg, cmap='gray')  # Assuming the second image is grayscale
-axes[1].set_title("Mask")
-
-# Plot the second image on the right
-axes[2].imshow(medsam_seg_prob)  # Assuming the second image is grayscale
-axes[2].set_title("Probability Map")
-
-# Hide axis ticks and labels
-for ax in axes:
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_xticklabels([])
-    ax.set_yticklabels([])
-
-# Display the images side by side
-plt.show()
-
-"""Now, let us load a new image and segment it using our trained model. NOte that we need to provide some prompt. Since we do not know where the objects are going to be we cannot supply bounding boxes. So let us provide a grid of points as our prompt."""
-
-#Apply a trained model on large image
-large_test_images = tifffile.imread("datasets/mitochondria/testing.tif")
-large_test_image = large_test_images[1]
-patches = patchify(large_test_image, (256, 256), step=256)  #Step=256 for 256 patches means no overlap
-
-"""
-input_points (torch.FloatTensor of shape (batch_size, num_points, 2)) —
-Input 2D spatial points, this is used by the prompt encoder to encode the prompt.
-Generally yields to much better results. The points can be obtained by passing a
-list of list of list to the processor that will create corresponding torch tensors
-of dimension 4. The first dimension is the image batch size, the second dimension
-is the point batch size (i.e. how many segmentation masks do we want the model to
-predict per input point), the third dimension is the number of points per segmentation
-mask (it is possible to pass multiple points for a single mask), and the last dimension
-is the x (vertical) and y (horizontal) coordinates of the point. If a different number
-of points is passed either for each image, or for each mask, the processor will create
-“PAD” points that will correspond to the (0, 0) coordinate, and the computation of the
-embedding will be skipped for these points using the labels.
-
-"""
-# Define the size of your array
-array_size = 256
-
-# Define the size of your grid
-grid_size = 10
-
-# Generate the grid points
-x = np.linspace(0, array_size-1, grid_size)
-y = np.linspace(0, array_size-1, grid_size)
-
-# Generate a grid of coordinates
-xv, yv = np.meshgrid(x, y)
-
-# Convert the numpy arrays to lists
-xv_list = xv.tolist()
-yv_list = yv.tolist()
-
-# Combine the x and y coordinates into a list of list of lists
-input_points = [[[int(x), int(y)] for x, y in zip(x_row, y_row)] for x_row, y_row in zip(xv_list, yv_list)]
-
-#We need to reshape our nxn grid to the expected shape of the input_points tensor
-# (batch_size, point_batch_size, num_points_per_image, 2),
-# where the last dimension of 2 represents the x and y coordinates of each point.
-#batch_size: The number of images you're processing at once.
-#point_batch_size: The number of point sets you have for each image.
-#num_points_per_image: The number of points in each set.
-input_points = torch.tensor(input_points).view(1, 1, grid_size*grid_size, 2)
-
-print(np.array(input_points).shape)
-
-patches.shape
-
-# Select a random patch for segmentation
-
-# Compute the total number of 256x256 arrays
-#num_arrays = patches.shape[0] * patches.shape[1]
-# Select a random index
-#index = np.random.choice(num_arrays)
-# Compute the indices in the original array
-#i = index // patches.shape[1]
-#j = index % patches.shape[1]
-
-#Or pick a specific patch for study.
-i, j = 2, 3
-
-# Selectelected patch for segmentation
-random_array = patches[i, j]
-
-
-single_patch = Image.fromarray(random_array)
-# prepare image for the model
-
-#First try without providing any prompt (no bounding box or input_points)
-#inputs = processor(single_patch, return_tensors="pt")
-#Now try with bounding boxes. Remember to uncomment.
-inputs = processor(single_patch, input_points=input_points, return_tensors="pt")
-
-# Move the input tensor to the GPU if it's not already there
-inputs = {k: v.to(device) for k, v in inputs.items()}
-my_mito_model.eval()
-
-
-# forward pass
-with torch.no_grad():
-  outputs = my_mito_model(**inputs, multimask_output=False)
-
-# apply sigmoid
-single_patch_prob = torch.sigmoid(outputs.pred_masks.squeeze(1))
-# convert soft mask to hard mask
-single_patch_prob = single_patch_prob.cpu().numpy().squeeze()
-single_patch_prediction = (single_patch_prob > 0.5).astype(np.uint8)
-
-
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-# Plot the first image on the left
-axes[0].imshow(np.array(single_patch), cmap='gray')  # Assuming the first image is grayscale
-axes[0].set_title("Image")
-
-# Plot the second image on the right
-axes[1].imshow(single_patch_prob)  # Assuming the second image is grayscale
-axes[1].set_title("Probability Map")
-
-# Plot the second image on the right
-axes[2].imshow(single_patch_prediction, cmap='gray')  # Assuming the second image is grayscale
-axes[2].set_title("Prediction")
-
-# Hide axis ticks and labels
-for ax in axes:
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_xticklabels([])
-    ax.set_yticklabels([])
-
-# Display the images side by side
-plt.show()

@@ -15,6 +15,10 @@ import torchvision.models as models
 import torch.nn as nn
 import argparse
 import pickle
+import random
+import json
+from pycocotools import mask as coco_mask
+
 
 def get_logger():
     logging.basicConfig()
@@ -193,3 +197,88 @@ def point_grid(image_size, n):
     grid = [[int(i * step_x), int(j * step_y)] for i in range(1, n + 1) for j in range(1, n + 1)]
 
     return grid
+
+def get_image_info(dataset_directory, num_images=1):
+    image_mask_pairs = []
+    for filename in os.listdir(dataset_directory):
+        if filename.endswith(".jpg"):
+            image_path = os.path.join(dataset_directory, filename)
+            mask_filename = filename.replace(".jpg", ".json")
+            mask_path = os.path.join(dataset_directory, mask_filename)
+            if os.path.exists(mask_path):
+                image_mask_pairs.append((image_path, mask_path))
+    selected_pairs = random.sample(image_mask_pairs, min(num_images, len(image_mask_pairs)))
+    return selected_pairs
+
+def get_ground_truth_masks(mask_path):
+    binary_masks = []
+    with open(mask_path, 'r') as json_file:
+        mask_data = json.load(json_file)
+    for annotation in mask_data['annotations']:
+        rle_mask = annotation['segmentation']
+        binary_mask = coco_mask.decode(rle_mask)
+        binary_masks.append(binary_mask)
+    return binary_masks
+
+def calculate_metrics(pred_mask, gt_mask):
+    intersection = np.logical_and(pred_mask, gt_mask).sum()
+    union = np.logical_or(pred_mask, gt_mask).sum()
+    iou = intersection / union if union != 0 else 0
+    return iou
+
+def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
+    BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+    pt = torch.exp(-BCE_loss)  # Prevents nans when probability 0
+    F_loss = alpha * (1-pt)**gamma * BCE_loss
+    return F_loss.mean() if reduction == 'mean' else F_loss.sum()
+
+def dice_loss(inputs, targets, smooth=1e-6):
+    inputs = torch.sigmoid(inputs)
+    inputs = inputs.view(-1)
+    targets = targets.view(-1)
+    intersection = (inputs * targets).sum()
+    dice = (2. * intersection + smooth) / (inputs.sum() + targets.sum() + smooth)
+    return 1 - dice
+
+def valid_points_from_masks(gt_masks):
+    points = []
+    for mask in gt_masks:
+        ys, xs = np.where(mask > 0)
+        points += [(x, y) for x, y in zip(xs, ys)]
+    return points
+
+def inference(model, dataloader, device='cuda'):
+    model.eval()
+    image_ious = []
+    with torch.no_grad():
+        for images, masks in dataloader:
+
+            print(f'images : {images.shape}')
+            print(f'masks : {masks.shape}')
+
+            images = images.to(device)
+            masks = masks.to(device)
+
+            outputs = model(images)['pred_masks']
+            print(f'outputs : {outputs}')
+            break 
+            # pred_masks = outputs.squeeze(1)
+            # pred_masks = pred_masks[:, 0, :, :].unsqueeze(1)
+            # pred_masks_resized = torch.nn.functional.interpolate(pred_masks, size=(256, 256), mode='bilinear', align_corners=False)
+
+            # for i in range(images.shape[0]):
+            #     gt_mask = masks[i].cpu().numpy().squeeze()
+            #     pred_mask = pred_masks_resized[i].cpu().numpy().squeeze()
+
+            #     valid_points = valid_points_from_masks([gt_mask])
+            #     random_points = random.sample(valid_points, min(5, len(valid_points)))
+            #     point_ious = []
+            #     for point in random_points:
+            #         x, y = point
+            #         iou = calculate_metrics(pred_mask[y:y+256, x:x+256], gt_mask[y:y+256, x:x+256])
+            #         point_ious.append(iou)
+            #     image_ious.append(sum(point_ious) / len(point_ious) if point_ious else 0)
+
+    # average_iou = sum(image_ious) / len(image_ious) if image_ious else 0
+    # return image_ious, average_iou
+    return 0, 0
