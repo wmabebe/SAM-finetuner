@@ -1,14 +1,17 @@
 import os
 from transformers import SamModel, SamConfig, SamProcessor
 from raffm import RaFFM
-from torch.utils.data import DataLoader
-from torch.utils.data import Subset
+from torch.utils.data import DataLoader, Subset
 from utility import *
 from dataset import SA1BDataset, SAMDataset
 from torch.optim import Adam
 import monai
 from statistics import mean
 
+TRAIN_SUBSET = 400
+TEST_SUBSET = 100
+EPOCHS = 20
+VERBOSE = False
 
 # Initialize the original SAM model and processor
 original_model = SamModel.from_pretrained("facebook/sam-vit-base").to("cuda")
@@ -37,14 +40,14 @@ train_dataset = SAMDataset(dataset=train_dataset, processor=processor)
 test_dataset = SAMDataset(dataset=test_dataset, processor=processor)
 
 # Apply subset for shoter training
-# subset_dataset = Subset(train_dataset, indices=range(20))
-# train_dataloader = DataLoader(subset_dataset, batch_size=2, shuffle=False)
-# subset_dataset = Subset(test_dataset, indices=range(20))
-# test_dataloader = DataLoader(subset_dataset, batch_size=2, shuffle=True)
+subset_dataset = Subset(train_dataset, indices=range(TRAIN_SUBSET))
+train_dataloader = DataLoader(subset_dataset, batch_size=2, shuffle=False)
+subset_dataset = Subset(test_dataset, indices=range(TEST_SUBSET))
+test_dataloader = DataLoader(subset_dataset, batch_size=2, shuffle=True)
 
 # # Create a DataLoader instance for the training dataset
-train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, drop_last=False)
-test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, drop_last=True)
+# train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, drop_last=False)
+# test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, drop_last=True)
 
 print(f'trainloader : {len(train_dataloader)}')
 print(f'trainloader : {len(test_dataloader)}')
@@ -56,18 +59,19 @@ print(f'pre-train mIoU : {miou}')
 
 # make sure we only compute gradients for mask decoder
 for name, param in submodel.named_parameters():
-  if name.startswith("vision_encoder") or name.startswith("prompt_encoder"):
+  if name.startswith("prompt_encoder"): # or name.startswith("mask_decoder") or #name.startswith("vision_encoder")
     param.requires_grad_(False)
 
 
 # Initialize the optimizer and the loss function
-optimizer = Adam(submodel.mask_decoder.parameters(), lr=1e-5, weight_decay=0)
+optimizer = Adam(list(submodel.vision_encoder.parameters()) + list(submodel.mask_decoder.parameters()), lr=1e-5, weight_decay=0)
+
 #Try DiceFocalLoss, FocalLoss, DiceCELoss
 seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
 
 #Training loop
-num_epochs = 10
+num_epochs = EPOCHS
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 submodel.to(device)
