@@ -115,11 +115,21 @@ if __name__ == '__main__':
             masks = processor.image_processor.post_process_masks(
                 outputs.pred_masks, batch["original_sizes"], batch["reshaped_input_sizes"], binarize=False,
             )
+            # print(f'masks : {len(masks)}')
+
+            predicted_masks = torch.stack([m.squeeze(0) for m in masks])
 
             # compute loss
-            predicted_masks = masks[0]  # outputs.pred_masks.squeeze(1)
+            #predicted_masks = masks[0] #outputs.pred_masks.squeeze(1)
             ground_truth_masks = batch["ground_truth_mask"].float().to(device)
+
+            # print(f'predicted_masks.shape : {predicted_masks.shape}')
+            # print(f'ground_truth_masks.shape : {ground_truth_masks.shape}')
+
+
+            # loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
             
+            #Updated Loss
             # Calculate focal loss and dice loss
             loss_focal = focal_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
             loss_dice = dice_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
