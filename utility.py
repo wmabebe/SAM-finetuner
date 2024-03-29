@@ -412,20 +412,26 @@ def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',dis
         )
 
         #print(f'masks[0] : {masks[0].shape}')
+        predicted_masks = torch.stack([m.squeeze(0) for m in masks])
 
         # compute iou
         #print(f'outputs.pred_masks shape : {outputs.pred_masks.shape}')
-        predicted_masks = outputs.pred_masks.squeeze(1)
-        predicted_masks = predicted_masks.squeeze(1)
+        #predicted_masks = outputs.pred_masks.squeeze(1)
+        #predicted_masks = predicted_masks.squeeze(1)
         ground_truth_masks = batch["ground_truth_mask"].float().to(device)
 
-        # apply sigmoid
-        # single_patch_prob = torch.sigmoid(predicted_masks)
-        # # convert soft mask to hard mask
-        # single_patch_prob = single_patch_prob.squeeze()
-        # predicted_masks_binary = (single_patch_prob > 0.5)
+        # print(f'predicted_masks.shape : {predicted_masks.shape}')
+        # print(f'ground_truth_masks.shape : {ground_truth_masks.shape}')
 
-        predicted_masks_binary = masks[0]
+        # apply sigmoid
+        single_patch_prob = torch.sigmoid(predicted_masks)
+        # convert soft mask to hard mask
+        single_patch_prob = single_patch_prob.squeeze()
+        predicted_masks_binary = (single_patch_prob > 0.5)
+
+        #print(f'predicted_masks_binary.shape : {predicted_masks_binary.shape}')
+
+        #predicted_masks_binary = masks[0]
 
         # print(f'predicted_masks_binary shape : {predicted_masks_binary.shape}')
         # print(f'ground_truth_masks shape : {ground_truth_masks.shape}')
