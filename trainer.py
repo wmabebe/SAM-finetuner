@@ -95,11 +95,10 @@ if __name__ == '__main__':
 
 
     # Initialize the optimizer and the loss function
-    optimizer = Adam(list(submodel.vision_encoder.parameters()) + list(submodel.mask_decoder.parameters()), lr=1e-5, weight_decay=0)
+    optimizer = Adam(list(submodel.vision_encoder.parameters()) + list(submodel.mask_decoder.parameters()), lr=1e-8, weight_decay=0)
 
     #Try DiceFocalLoss, FocalLoss, DiceCELoss
     seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
-
 
     #Training loop
     submodel.to(device)
@@ -118,9 +117,15 @@ if __name__ == '__main__':
             )
 
             # compute loss
-            predicted_masks = masks[0] #outputs.pred_masks.squeeze(1)
+            predicted_masks = masks[0]  # outputs.pred_masks.squeeze(1)
             ground_truth_masks = batch["ground_truth_mask"].float().to(device)
-            loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+            
+            # Calculate focal loss and dice loss
+            loss_focal = focal_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+            loss_dice = dice_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+            
+            # Combine the losses
+            loss = 20 * loss_focal + loss_dice
 
             # backward pass (compute gradients of parameters w.r.t. loss)
             optimizer.zero_grad()
@@ -130,8 +135,8 @@ if __name__ == '__main__':
             optimizer.step()
             epoch_losses.append(loss.item())
 
-        print(f'EPOCH: {epoch}')
-        print(f'Mean loss: {mean(epoch_losses)}')
+    print(f'EPOCH: {epoch}')
+    print(f'Mean loss: {mean(epoch_losses)}')
 
     # Save the model's state dictionary to a file
     torch.save(submodel.state_dict(), "models/sa1b_submodel_checkpoint.pth")
@@ -149,6 +154,55 @@ if __name__ == '__main__':
     my_saved_submodel.load_state_dict(torch.load("models/sa1b_submodel_checkpoint.pth"))
 
     my_saved_submodel.to(device)
+
+    # #Training loop
+    # submodel.to(device)
+
+    # submodel.train()
+    # for epoch in range(args.epochs):
+    #     epoch_losses = []
+    #     for batch in tqdm(train_dataloader, disable=args.no_verbose):
+    #         # forward pass
+    #         outputs = submodel(pixel_values=batch["pixel_values"].to(device),
+    #                         input_boxes=batch["input_boxes"].to(device),
+    #                         multimask_output=False)
+            
+    #         masks = processor.image_processor.post_process_masks(
+    #             outputs.pred_masks, batch["original_sizes"], batch["reshaped_input_sizes"], binarize=False,
+    #         )
+
+    #         # compute loss
+    #         predicted_masks = masks[0] #outputs.pred_masks.squeeze(1)
+    #         ground_truth_masks = batch["ground_truth_mask"].float().to(device)
+    #         loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+
+    #         # backward pass (compute gradients of parameters w.r.t. loss)
+    #         optimizer.zero_grad()
+    #         loss.backward()
+
+    #         # optimize
+    #         optimizer.step()
+    #         epoch_losses.append(loss.item())
+
+    #     print(f'EPOCH: {epoch}')
+    #     print(f'Mean loss: {mean(epoch_losses)}')
+
+    # # Save the model's state dictionary to a file
+    # torch.save(submodel.state_dict(), "models/sa1b_submodel_checkpoint.pth")
+    # torch.save(config,"models/sa1b_submodel_config.pth")
+
+    # """**Inference**"""
+
+    # # Load the model configuration
+    # config = torch.load("models/sa1b_submodel_config.pth")
+    # processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+
+    # # Create an instance of the model architecture with the loaded configuration
+    # my_saved_submodel, total_params = raffm_model.resource_aware_model(config)
+    # #Update the model by loading the weights from saved file.
+    # my_saved_submodel.load_state_dict(torch.load("models/sa1b_submodel_checkpoint.pth"))
+
+    # my_saved_submodel.to(device)
 
 
     #Testing
