@@ -2,7 +2,9 @@ __pycache__/
 datasets/
 models/
 RaFFM-main/
+logs/
 *.out
 *.pth
 *.jpg
 *.pyc
+*.png

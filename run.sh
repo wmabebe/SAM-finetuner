@@ -13,7 +13,7 @@ module load cuda/11.7
 module load gcc/9.1.0
 
 
-python trainer.py
+python trainer.py --dataset=sa1b --epochs=5 --batch_size=1 --train_subset=100 --test_subset=20
 
 #python hugging.py
 

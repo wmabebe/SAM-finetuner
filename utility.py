@@ -16,7 +16,21 @@ import tifffile
 from patchify import patchify  #Only to handle large images
 from datasets import Dataset as DatasetX
 from tqdm import tqdm
+import argparse
+import gc
 
+def get_args():
+    parser = argparse.ArgumentParser()
+    valid_datasets = ['sa1b', 'mito']
+    parser.add_argument('--dataset', type=str, choices=valid_datasets, default='sa1b', help='Dataset (choices: {%(choices)s}, default: %(default)s)')
+    parser.add_argument('--train_subset', type=int, default=0, help='Specify training data size. Leave 0 if for default dataset size.')
+    parser.add_argument('--test_subset', type=int, default=0, help='Specify testing data size. Leave 0 if for default dataset size.')
+    parser.add_argument('--epochs', type=int, default=20, help='Training epochs')
+    parser.add_argument('--batch_size', type=int, default=2, help='Specify dataloader batch size.')
+    parser.add_argument('--no_verbose', action='store_true', help='Enable to disable verbose mode')
+
+    args = parser.parse_args()
+    return args
 
 def get_logger():
     logging.basicConfig()
@@ -46,14 +60,6 @@ def init_logs(log_file_name, log_dir=None):
     
     return logger
 
-def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='res18', help='Neural network used for encoding')
-    parser.add_argument('--embed', type=int, default=1, help='Embed chips to a latent space vector')
-    parser.add_argument('--post', type=int, default=0, help='Apply post processing to remove bad masks')
-    args = parser.parse_args()
-    return args
-
 def show_anns(anns):
     if len(anns) == 0:
         return
@@ -70,15 +76,49 @@ def show_anns(anns):
     ax.imshow(img)
 
 
+# def show_mask(mask, ax, random_color=False):
+#     if random_color:
+#         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+#     else:
+#         color = np.array([30/255, 144/255, 255/255, 0.6])
+#     h, w = mask.shape[-2:]
+#     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+#     ax.imshow(mask_image)
+
 def show_mask(mask, ax, random_color=False):
     if random_color:
         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
     else:
-        color = np.array([30/255, 144/255, 255/255, 0.6])
+        color = np.array([30 / 255, 144 / 255, 255 / 255, 0.6])
     h, w = mask.shape[-2:]
     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
     ax.imshow(mask_image)
-    
+    del mask
+    gc.collect()
+
+def show_masks_on_image(raw_image, masks, filename=None):
+    plt.imshow(np.array(raw_image))
+    ax = plt.gca()
+    ax.set_autoscale_on(False)
+    for mask in masks:
+        show_mask(mask, ax=ax, random_color=True)
+    plt.axis("off")
+    if not filename:
+        plt.show()
+        del mask
+        gc.collect()
+    else:
+        plt.savefig(filename, bbox_inches='tight', pad_inches=0)  # Save the figure to file
+        plt.close()
+
+def save_masks(masks,filename):
+    numpy_array = masks.squeeze().numpy()
+    # Plot the NumPy array using matplotlib
+    plt.imshow(numpy_array, cmap='gray')  # Assuming grayscale image
+    plt.axis('off')  # Turn off axis
+    plt.savefig(filename, bbox_inches='tight', pad_inches=0)  # Save the figure
+    plt.close()  # Close the plot to free memory
+        
 def show_points(coords, labels, ax, marker_size=375):
     pos_points = coords[labels==1]
     neg_points = coords[labels==0]
@@ -96,7 +136,8 @@ def show_box(box, ax, label="",linecolor=[]):
         ax.text(label_x, label_y, label, fontsize=20, color='red',
                 ha='center', va='center')
 
-
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def mutual_overlap(parent_mask, child_mask):
     intersection_mask = np.logical_and(parent_mask, child_mask)
@@ -126,6 +167,13 @@ def mutual_overlap(parent_mask, child_mask):
     return child_overlap, parent_overlap, intersection_overlap
 
 def compute_iou(mask_pred, mask_gt):
+    mask_pred = mask_pred.view(-1, mask_pred.shape[-2], mask_pred.shape[-1])
+    mask_gt = mask_gt.view(-1, mask_gt.shape[-2], mask_gt.shape[-1])
+
+    mask_pred, mask_gt = mask_pred.cpu(), mask_gt.cpu()
+    # print(f'mask_pred.shape : {mask_pred.shape} \t mask_gt.shape : {mask_gt.shape}')
+
+    mask_pred, mask_gt = mask_pred.numpy(), mask_gt.numpy()
     intersection = np.logical_and(mask_pred, mask_gt)
     union = np.logical_or(mask_pred, mask_gt)
     
@@ -208,6 +256,8 @@ def get_image_info(dataset_directory, num_images=1):
     selected_pairs = random.sample(image_mask_pairs, min(num_images, len(image_mask_pairs)))
     return selected_pairs
 
+
+
 def get_ground_truth_masks(mask_path):
     binary_masks = []
     with open(mask_path, 'r') as json_file:
@@ -244,42 +294,6 @@ def valid_points_from_masks(gt_masks):
         ys, xs = np.where(mask > 0)
         points += [(x, y) for x, y in zip(xs, ys)]
     return points
-
-def inference(model, dataloader, device='cuda'):
-    model.eval()
-    image_ious = []
-    with torch.no_grad():
-        for images, masks in dataloader:
-
-            print(f'images : {images.shape}')
-            print(f'masks : {masks.shape}')
-
-            images = images.to(device)
-            masks = masks.to(device)
-
-            outputs = model(images)['pred_masks']
-            print(f'outputs : {outputs}')
-            break 
-            # pred_masks = outputs.squeeze(1)
-            # pred_masks = pred_masks[:, 0, :, :].unsqueeze(1)
-            # pred_masks_resized = torch.nn.functional.interpolate(pred_masks, size=(256, 256), mode='bilinear', align_corners=False)
-
-            # for i in range(images.shape[0]):
-            #     gt_mask = masks[i].cpu().numpy().squeeze()
-            #     pred_mask = pred_masks_resized[i].cpu().numpy().squeeze()
-
-            #     valid_points = valid_points_from_masks([gt_mask])
-            #     random_points = random.sample(valid_points, min(5, len(valid_points)))
-            #     point_ious = []
-            #     for point in random_points:
-            #         x, y = point
-            #         iou = calculate_metrics(pred_mask[y:y+256, x:x+256], gt_mask[y:y+256, x:x+256])
-            #         point_ious.append(iou)
-            #     image_ious.append(sum(point_ious) / len(point_ious) if point_ious else 0)
-
-    # average_iou = sum(image_ious) / len(image_ious) if image_ious else 0
-    # return image_ious, average_iou
-    return 0, 0
 
 # Load tiff stack images and masks
 def load_dataset(data_path, label_path, patch_size=256, step=256):
@@ -346,49 +360,8 @@ def load_dataset(data_path, label_path, patch_size=256, step=256):
     dataset = DatasetX.from_dict(dataset_dict)
 
     return dataset
-
-
-"""Get bounding boxes from masks. You can get here directly if you are working with coco style annotations where bounding boxes are captured in a JSON file."""
-
-#Get bounding boxes from mask.
-def get_bounding_box(ground_truth_map):
-  # get bounding box from mask
-  y_indices, x_indices = np.where(ground_truth_map > 0)
-  x_min, x_max = np.min(x_indices), np.max(x_indices)
-  y_min, y_max = np.min(y_indices), np.max(y_indices)
-  # add perturbation to bounding box coordinates
-  H, W = ground_truth_map.shape
-  x_min = max(0, x_min - np.random.randint(0, 20))
-  x_max = min(W, x_max + np.random.randint(0, 20))
-  y_min = max(0, y_min - np.random.randint(0, 20))
-  y_max = min(H, y_max + np.random.randint(0, 20))
-  bbox = [x_min, y_min, x_max, y_max]
-
-  return bbox
-
-def compute_iou(predicted_masks, gt_masks):
-
-    # Convert predicted and ground truth masks to boolean tensors
-    predicted_masks_bool = predicted_masks.bool()
-    gt_masks_bool = gt_masks.bool()
-
-    # Compute intersection and union
-    intersection = (predicted_masks_bool & gt_masks_bool).sum(dim=(1, 2)).float()
-    union = (predicted_masks_bool | gt_masks_bool).sum(dim=(1, 2)).float()
-
-    # Compute IoU
-    iou = intersection / (union + 1e-10)  # Adding epsilon to avoid division by zero
-
-    iou = torch.mean(iou)
-
-    return round(iou.item(), 4)
   
-def get_prompt_grid(size=10, batch_size=1):
-    # Define the size of your array
-   array_size = 256
-
-    # Define the size of your grid
-   grid_size = size
+def get_prompt_grid(array_size=256, grid_size=10, batch_size=1):
 
     # Generate the grid points
    x = np.linspace(0, array_size-1, grid_size)
@@ -409,39 +382,63 @@ def get_prompt_grid(size=10, batch_size=1):
    
    return input_points
 
+
+
 #Test model performance on given dataset
-def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',disable_verbose=False):
+def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',disable_verbose=False,processor=None):
     mIoU = []
     count = 0
-    input_points = get_prompt_grid(grid_size,batch_size)
-    print(f'input_points :  {input_points.shape}')
     model.eval()
     model = model.to(device)
     for batch in tqdm(dataloader, disable=disable_verbose):
+        
+        #print(f'batch_imgs shape : {batch["pixel_values"].shape}')
+        array_size = batch["pixel_values"].shape[-1]
+        input_points = get_prompt_grid(array_size,grid_size,batch_size)
+        #print(f'input_points shape : {input_points.shape}')
 
-        # inputs = processor(batch["pixel_values"], input_points=input_points, return_tensors="pt")
-        # inputs = {k: v.to(device) for k, v in inputs.items()}
+        #for k,v in batch.items():
+        #    print(f'batch[{k}] --> {v.shape}')
 
         # forward pass
         with torch.no_grad():
-          outputs = model(pixel_values=batch["pixel_values"].to(device),
-                        input_points=input_points.to(device),
+            outputs = model(pixel_values=batch["pixel_values"].to(device),
+                        input_boxes=batch["input_boxes"].to(device),
                         multimask_output=False)
-          #outputs = my_mito_model(**inputs, multimask_output=False)
+            # outputs = my_mito_model(**inputs, multimask_output=False)
+        
+        masks = processor.image_processor.post_process_masks(
+            outputs.pred_masks, batch["original_sizes"], batch["reshaped_input_sizes"]
+        )
+
+        #print(f'masks[0] : {masks[0].shape}')
 
         # compute iou
+        #print(f'outputs.pred_masks shape : {outputs.pred_masks.shape}')
         predicted_masks = outputs.pred_masks.squeeze(1)
+        predicted_masks = predicted_masks.squeeze(1)
         ground_truth_masks = batch["ground_truth_mask"].float().to(device)
 
-
         # apply sigmoid
-        single_patch_prob = torch.sigmoid(outputs.pred_masks.squeeze(1))
-        # convert soft mask to hard mask
-        single_patch_prob = single_patch_prob.squeeze()
-        predicted_masks_binary = (single_patch_prob > 0.5)
+        # single_patch_prob = torch.sigmoid(predicted_masks)
+        # # convert soft mask to hard mask
+        # single_patch_prob = single_patch_prob.squeeze()
+        # predicted_masks_binary = (single_patch_prob > 0.5)
 
+        predicted_masks_binary = masks[0]
 
+        # print(f'predicted_masks_binary shape : {predicted_masks_binary.shape}')
+        # print(f'ground_truth_masks shape : {ground_truth_masks.shape}')
         mIoU.append(compute_iou(predicted_masks_binary,ground_truth_masks))
+
+        # Visualize masks
+        # to_pil = transforms.ToPILImage()
+        # raw_image = batch["pixel_values"].squeeze(0).cpu()
+        # masks = [masks[0].cpu()]
+        # ground_truth_masks = ground_truth_masks.cpu()
+        # raw_image = to_pil(raw_image)
+        # save_masks(masks[0], f'logs/{count}predicted.png')
+        # save_masks(ground_truth_masks, f'logs/{count}ground_truth.png')
 
         if count == size:
           break
