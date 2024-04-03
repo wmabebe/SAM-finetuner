@@ -62,18 +62,18 @@ if __name__ == '__main__':
         # Apply subset for shorter training
         if args.train_subset:
             subset_dataset = Subset(dataset, indices=range(0,args.train_subset,1))
-            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False)
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, collate_fn = custom_collate_fn) #collate_fn = custom_collate_fn
         
         else:
             subset_dataset = Subset(dataset, indices=range(0,10000,1))
-            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, collate_fn = custom_collate_fn)
         
         if args.test_subset:
             subset_dataset = Subset(dataset, indices=range(args.train_subset,args.train_subset + args.test_subset,1))
-            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn = custom_collate_fn) #collate_fn = custom_collate_fn
         else:
             subset_dataset = Subset(dataset, indices=range(10000,len(dataset),1))
-            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True)
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn = custom_collate_fn)
 
 
     print(f'trainloader : {len(train_dataloader)}')
@@ -88,54 +88,99 @@ if __name__ == '__main__':
     print(f'submodel pre-train mIoU : {miou}')
 
     
-    # make sure we only compute gradients for mask decoder
-    for name, param in submodel.named_parameters():
-      if name.startswith("prompt_encoder"): # or name.startswith("mask_decoder") or #name.startswith("vision_encoder")
-        param.requires_grad_(False)
+    # Freeze modules that are not set as trainable
+    if 'p' not in args.trainable:
+        for name, param in submodel.named_parameters():
+            if name.startswith("prompt_encoder"):
+                param.requires_grad_(False)
+    if 'e' not in args.trainable:
+         for name, param in submodel.named_parameters():
+            if name.startswith("vision_encoder"):
+                param.requires_grad_(False)
+    if 'm' not in args.trainable:
+         for name, param in submodel.named_parameters():
+            if name.startswith("mask_decoder"):
+                param.requires_grad_(False)
 
 
+    #Select the parameters to train
+    trainable_params = []
+    if 'e' in args.trainable:
+        trainable_params += list(submodel.vision_encoder.parameters())
+    if 'm' in args.trainable:
+        trainable_params += list(submodel.mask_decoder.parameters())
+    if 'p' in args.trainable:
+        trainable_params += list(submodel.prompt_encoder.parameters())
+    
     # Initialize the optimizer and the loss function
-    optimizer = Adam(list(submodel.vision_encoder.parameters()) + list(submodel.mask_decoder.parameters()), lr=1e-8, weight_decay=0)
+    optimizer = Adam(trainable_params, lr=1e-5, weight_decay=0)
 
     #Try DiceFocalLoss, FocalLoss, DiceCELoss
     seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
     #Training loop
+    ragged_tensors = False
     submodel.to(device)
-
     submodel.train()
     for epoch in range(args.epochs):
         epoch_losses = []
-        for batch in tqdm(train_dataloader, disable=args.no_verbose):
+        for (data, gts) in tqdm(train_dataloader, disable=args.no_verbose):
+
+            #SA1B case rework data returned from the dataloader 
+            if type(data) == list:
+                ragged_tensors = True
+                data = {'pixel_values': torch.stack([d['pixel_values'] for d in data]),
+                 'original_sizes' : torch.stack([d['original_sizes'] for d in data]),
+                 'reshaped_input_sizes' : torch.stack([d['reshaped_input_sizes'] for d in data]),
+                 'input_boxes' : torch.stack([d['input_boxes'] for d in data])}
+
             # forward pass
-            outputs = submodel(pixel_values=batch["pixel_values"].to(device),
-                            input_boxes=batch["input_boxes"].to(device),
-                            multimask_output=False)
+            outputs = submodel(pixel_values=data["pixel_values"].to(device),
+                        input_boxes=data["input_boxes"].to(device),
+                        multimask_output=False)
+
             
             masks = processor.image_processor.post_process_masks(
-                outputs.pred_masks, batch["original_sizes"], batch["reshaped_input_sizes"], binarize=False,
+                outputs.pred_masks, data["original_sizes"], data["reshaped_input_sizes"], binarize=False
             )
-            # print(f'masks : {len(masks)}')
-
-            predicted_masks = torch.stack([m.squeeze(0) for m in masks])
-
-            # compute loss
-            #predicted_masks = masks[0] #outputs.pred_masks.squeeze(1)
-            ground_truth_masks = batch["ground_truth_mask"].float().to(device)
-
-            # print(f'predicted_masks.shape : {predicted_masks.shape}')
-            # print(f'ground_truth_masks.shape : {ground_truth_masks.shape}')
-
-
-            # loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
             
-            #Updated Loss
-            # Calculate focal loss and dice loss
-            loss_focal = focal_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
-            loss_dice = dice_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
-            
-            # Combine the losses
-            loss = 20 * loss_focal + loss_dice
+            #data images have varying shapes (not stackable)
+            if ragged_tensors:
+                predicted_masks = [m.squeeze(0) for m in masks]
+                ground_truth_masks = gts
+
+                total_loss = []
+
+                for pred, gt in zip(predicted_masks, gts):
+                    #gt = gt.to(device)
+                    pred, gt = pred.cpu(), gt.cpu()
+                    sample_loss = seg_loss(pred, gt.unsqueeze(0))
+                    total_loss.append(sample_loss)
+
+                loss = sum(total_loss) / len(total_loss)
+
+            #data images have identical shapes (hence stackable)
+            else:
+                predicted_masks = torch.stack([m.squeeze(0) for m in masks])
+
+                # compute loss
+                #predicted_masks = masks[0] #outputs.pred_masks.squeeze(1)
+                #ground_truth_masks = batch["ground_truth_mask"].float().to(device)
+                ground_truth_masks = gts.float().to(device)
+
+                # print(f'predicted_masks.shape : {predicted_masks.shape}')
+                # print(f'ground_truth_masks.shape : {ground_truth_masks.shape}')
+
+
+                loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+                
+                #Updated Loss
+                # Calculate focal loss and dice loss
+                # loss_focal = focal_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+                # loss_dice = dice_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+                
+                # Combine the losses
+                # loss = 20 * loss_focal + loss_dice
 
             # backward pass (compute gradients of parameters w.r.t. loss)
             optimizer.zero_grad()
@@ -145,14 +190,18 @@ if __name__ == '__main__':
             optimizer.step()
             epoch_losses.append(loss.item())
 
-    print(f'EPOCH: {epoch}')
-    print(f'Mean loss: {mean(epoch_losses)}')
+            #Freeup GPU cache
+            #torch.cuda.empty_cache()
+
+
+        print(f'EPOCH: {epoch}')
+        print(f'Mean loss: {mean(epoch_losses)}')
 
     # Save the model's state dictionary to a file
     torch.save(submodel.state_dict(), "models/sa1b_submodel_checkpoint.pth")
     torch.save(config,"models/sa1b_submodel_config.pth")
 
-    """**Inference**"""
+    """Inference"""
 
     # Load the model configuration
     config = torch.load("models/sa1b_submodel_config.pth")
@@ -164,58 +213,6 @@ if __name__ == '__main__':
     my_saved_submodel.load_state_dict(torch.load("models/sa1b_submodel_checkpoint.pth"))
 
     my_saved_submodel.to(device)
-
-    # #Training loop
-    # submodel.to(device)
-
-    # submodel.train()
-    # for epoch in range(args.epochs):
-    #     epoch_losses = []
-    #     for batch in tqdm(train_dataloader, disable=args.no_verbose):
-    #         # forward pass
-    #         outputs = submodel(pixel_values=batch["pixel_values"].to(device),
-    #                         input_boxes=batch["input_boxes"].to(device),
-    #                         multimask_output=False)
-            
-    #         masks = processor.image_processor.post_process_masks(
-    #             outputs.pred_masks, batch["original_sizes"], batch["reshaped_input_sizes"], binarize=False,
-    #         )
-
-    #         # compute loss
-    #         predicted_masks = masks[0] #outputs.pred_masks.squeeze(1)
-    #         ground_truth_masks = batch["ground_truth_mask"].float().to(device)
-    #         loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
-
-    #         # backward pass (compute gradients of parameters w.r.t. loss)
-    #         optimizer.zero_grad()
-    #         loss.backward()
-
-    #         # optimize
-    #         optimizer.step()
-    #         epoch_losses.append(loss.item())
-
-    #     print(f'EPOCH: {epoch}')
-    #     print(f'Mean loss: {mean(epoch_losses)}')
-
-    # # Save the model's state dictionary to a file
-    # torch.save(submodel.state_dict(), "models/sa1b_submodel_checkpoint.pth")
-    # torch.save(config,"models/sa1b_submodel_config.pth")
-
-    # """**Inference**"""
-
-    # # Load the model configuration
-    # config = torch.load("models/sa1b_submodel_config.pth")
-    # processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
-
-    # # Create an instance of the model architecture with the loaded configuration
-    # my_saved_submodel, total_params = raffm_model.resource_aware_model(config)
-    # #Update the model by loading the weights from saved file.
-    # my_saved_submodel.load_state_dict(torch.load("models/sa1b_submodel_checkpoint.pth"))
-
-    # my_saved_submodel.to(device)
-
-
-    #Testing
 
     miou = test(my_saved_submodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
     print(f'submodel post-train mIoU : {miou}')

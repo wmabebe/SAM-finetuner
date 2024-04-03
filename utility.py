@@ -22,7 +22,9 @@ import gc
 def get_args():
     parser = argparse.ArgumentParser()
     valid_datasets = ['sa1b', 'mito']
+    valid_trainables = ['e','m','p', 'em', 'ep','mp','emp']
     parser.add_argument('--dataset', type=str, choices=valid_datasets, default='sa1b', help='Dataset (choices: {%(choices)s}, default: %(default)s)')
+    parser.add_argument('--trainable', type=str, choices=valid_trainables, default='e', help='Choice of SAM modules to train (Encoder, Mask decoder, Both) (choices: {%(choices)s}, default: %(default)s)')
     parser.add_argument('--train_subset', type=int, default=0, help='Specify training data size. Leave 0 if for default dataset size.')
     parser.add_argument('--test_subset', type=int, default=0, help='Specify testing data size. Leave 0 if for default dataset size.')
     parser.add_argument('--epochs', type=int, default=20, help='Training epochs')
@@ -167,18 +169,33 @@ def mutual_overlap(parent_mask, child_mask):
     return child_overlap, parent_overlap, intersection_overlap
 
 def compute_iou(mask_pred, mask_gt):
-    mask_pred = mask_pred.view(-1, mask_pred.shape[-2], mask_pred.shape[-1])
-    mask_gt = mask_gt.view(-1, mask_gt.shape[-2], mask_gt.shape[-1])
 
-    mask_pred, mask_gt = mask_pred.cpu(), mask_gt.cpu()
-    # print(f'mask_pred.shape : {mask_pred.shape} \t mask_gt.shape : {mask_gt.shape}')
+    if isinstance(mask_pred, list):
+        miou = []
+        for pred, gt in zip(mask_pred,mask_gt):
+            pred, gt = pred.cpu(), gt.cpu()
+            intersection = torch.logical_and(pred, gt).sum().float()
+            union = torch.logical_or(pred, gt).sum().float()
+            iou = intersection / union if union > 0 else 0.0
+            miou.append(iou)
+        miou = sum(miou) / len(miou)
+        return miou.item()
 
-    mask_pred, mask_gt = mask_pred.numpy(), mask_gt.numpy()
-    intersection = np.logical_and(mask_pred, mask_gt)
-    union = np.logical_or(mask_pred, mask_gt)
-    
-    iou = np.sum(intersection) / np.sum(union)
-    return iou
+    elif isinstance(mask_pred, torch.Tensor):
+        mask_pred = mask_pred.view(-1, mask_pred.shape[-2], mask_pred.shape[-1])
+        mask_gt = mask_gt.view(-1, mask_gt.shape[-2], mask_gt.shape[-1])
+
+        mask_pred, mask_gt = mask_pred.cpu(), mask_gt.cpu()
+        # print(f'mask_pred.shape : {mask_pred.shape} \t mask_gt.shape : {mask_gt.shape}')
+
+        mask_pred, mask_gt = mask_pred.numpy(), mask_gt.numpy()
+        intersection = np.logical_and(mask_pred, mask_gt)
+        union = np.logical_or(mask_pred, mask_gt)
+        
+        iou = np.sum(intersection) / np.sum(union)
+        return iou
+    else:
+        raise Exception(f'mask_pred is neither a torch tensor nor a list!')
 
 def calculate_metrics(predicted_mask, ground_truth_mask):    
     intersection = np.logical_and(predicted_mask, ground_truth_mask)
@@ -382,60 +399,81 @@ def get_prompt_grid(array_size=256, grid_size=10, batch_size=1):
    
    return input_points
 
+# No need to define a new class
+# Suppose you know the order of your customized Dataset
+def custom_collate_fn(batch):
+    return list(map(list, zip(*batch)))  # transpose list of list
 
 
 #Test model performance on given dataset
 def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',disable_verbose=False,processor=None):
+    ragged_tensors = False
     mIoU = []
     count = 0
     model.eval()
     model = model.to(device)
-    for batch in tqdm(dataloader, disable=disable_verbose):
-        
-        #print(f'batch_imgs shape : {batch["pixel_values"].shape}')
-        array_size = batch["pixel_values"].shape[-1]
-        input_points = get_prompt_grid(array_size,grid_size,batch_size)
-        #print(f'input_points shape : {input_points.shape}')
+    for (data, gts) in tqdm(dataloader, disable=disable_verbose):
 
-        #for k,v in batch.items():
-        #    print(f'batch[{k}] --> {v.shape}')
+        #SA1B case rework data returned from the dataloader
+        if type(data) == list:
+            ragged_tensors = True
+            data = {'pixel_values': torch.stack([d['pixel_values'] for d in data]),
+                 'original_sizes' : torch.stack([d['original_sizes'] for d in data]),
+                 'reshaped_input_sizes' : torch.stack([d['reshaped_input_sizes'] for d in data]),
+                 'input_boxes' : torch.stack([d['input_boxes'] for d in data])}
 
         # forward pass
         with torch.no_grad():
-            outputs = model(pixel_values=batch["pixel_values"].to(device),
-                        input_boxes=batch["input_boxes"].to(device),
+            outputs = model(pixel_values=data["pixel_values"].to(device),
+                        input_boxes=data["input_boxes"].to(device),
                         multimask_output=False)
             # outputs = my_mito_model(**inputs, multimask_output=False)
         
         masks = processor.image_processor.post_process_masks(
-            outputs.pred_masks, batch["original_sizes"], batch["reshaped_input_sizes"]
+            outputs.pred_masks, data["original_sizes"], data["reshaped_input_sizes"]
         )
 
-        #print(f'masks[0] : {masks[0].shape}')
-        predicted_masks = torch.stack([m.squeeze(0) for m in masks])
+        #If images have varying shapes pass (list,list) to compute_miou
+        if ragged_tensors:
+            predicted_masks_binary = []
+            for mask in [m.squeeze(0) for m in masks]:
+                single_patch_prob = torch.sigmoid(mask)
+                # convert soft mask to hard mask
+                single_patch_prob = single_patch_prob.squeeze()
+                bin_mask = (single_patch_prob > 0.5)
+                predicted_masks_binary.append(bin_mask)
 
-        # compute iou
-        #print(f'outputs.pred_masks shape : {outputs.pred_masks.shape}')
-        #predicted_masks = outputs.pred_masks.squeeze(1)
-        #predicted_masks = predicted_masks.squeeze(1)
-        ground_truth_masks = batch["ground_truth_mask"].float().to(device)
+            ground_truth_masks = gts
+            mIoU.append(compute_iou(predicted_masks_binary,ground_truth_masks))
 
-        # print(f'predicted_masks.shape : {predicted_masks.shape}')
-        # print(f'ground_truth_masks.shape : {ground_truth_masks.shape}')
+        else:
+            #print(f'masks[0] : {masks[0].shape}')
+            predicted_masks = torch.stack([m.squeeze(0) for m in masks])
 
-        # apply sigmoid
-        single_patch_prob = torch.sigmoid(predicted_masks)
-        # convert soft mask to hard mask
-        single_patch_prob = single_patch_prob.squeeze()
-        predicted_masks_binary = (single_patch_prob > 0.5)
+            # compute iou
+            #print(f'outputs.pred_masks shape : {outputs.pred_masks.shape}')
+            #predicted_masks = outputs.pred_masks.squeeze(1)
+            #predicted_masks = predicted_masks.squeeze(1)
+            #ground_truth_masks = data["ground_truth_mask"].float().to(device)
+            ground_truth_masks = gts
+            #ground_truth_masks = torch.stack([gt for gt in gts])
 
-        #print(f'predicted_masks_binary.shape : {predicted_masks_binary.shape}')
+            # print(f'predicted_masks.shape : {predicted_masks.shape}')
+            # print(f'ground_truth_masks.shape : {ground_truth_masks.shape}')
 
-        #predicted_masks_binary = masks[0]
+            # apply sigmoid
+            single_patch_prob = torch.sigmoid(predicted_masks)
+            # convert soft mask to hard mask
+            single_patch_prob = single_patch_prob.squeeze()
+            predicted_masks_binary = (single_patch_prob > 0.5)
 
-        # print(f'predicted_masks_binary shape : {predicted_masks_binary.shape}')
-        # print(f'ground_truth_masks shape : {ground_truth_masks.shape}')
-        mIoU.append(compute_iou(predicted_masks_binary,ground_truth_masks))
+            #print(f'predicted_masks_binary.shape : {predicted_masks_binary.shape}')
+
+            #predicted_masks_binary = masks[0]
+
+            # print(f'predicted_masks_binary shape : {predicted_masks_binary.shape}')
+            # print(f'ground_truth_masks shape : {ground_truth_masks.shape}')
+            mIoU.append(compute_iou(predicted_masks_binary,ground_truth_masks))
 
         # Visualize masks
         # to_pil = transforms.ToPILImage()

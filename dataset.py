@@ -14,6 +14,10 @@ class SA1BDataset(torch.utils.data.Dataset):
         self.datadir = dataset_directory
         self.processor = processor
         self.imgs, self.labels = SA1BDataset.get_image_json_pairs(self.datadir)
+        self.target_transform = transforms.Compose([
+                                 transforms.Resize((1024, 1024)),  # Resize to 1024x1024
+                                transforms.ToTensor()  # Convert to tensor
+                                ])
 
     def __len__(self):
         return len(self.imgs)
@@ -70,6 +74,7 @@ class SA1BDataset(torch.utils.data.Dataset):
         mask = masks[0]
         bin_ground_truth_mask = mask_utils.decode(mask['segmentation'])
         bbox_prompt = SA1BDataset.get_bounding_box(bin_ground_truth_mask)
+        bin_ground_truth_mask = torch.tensor(bin_ground_truth_mask)
         
         # prepare image and prompt for the model
         inputs = self.processor(image, input_boxes=[[bbox_prompt]], return_tensors="pt")
@@ -77,11 +82,7 @@ class SA1BDataset(torch.utils.data.Dataset):
         # remove batch dimension which the processor adds by default
         inputs = {k:v.squeeze(0) for k,v in inputs.items()}
 
-        # add ground truth segmentation
-        inputs["ground_truth_mask"] = bin_ground_truth_mask
-
-
-        return inputs
+        return inputs, bin_ground_truth_mask
     
 class MitoDataset(torch.utils.data.Dataset):
     """
@@ -117,6 +118,8 @@ class MitoDataset(torch.utils.data.Dataset):
         image = item["image"]
         ground_truth_mask = np.array(item["label"])
 
+        ground_truth_mask = torch.tensor(ground_truth_mask)
+
         # get bounding box prompt
         prompt = MitoDataset.get_bounding_box(ground_truth_mask)
 
@@ -132,7 +135,4 @@ class MitoDataset(torch.utils.data.Dataset):
         # remove batch dimension which the processor adds by default
         inputs = {k:v.squeeze(0) for k,v in inputs.items()}
 
-        # add ground truth segmentation
-        inputs["ground_truth_mask"] = ground_truth_mask
-
-        return inputs
+        return inputs, ground_truth_mask
