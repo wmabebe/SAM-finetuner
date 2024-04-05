@@ -15,6 +15,8 @@ if __name__ == '__main__':
     #torch.cuda.empty_cache()
     args = get_args()
 
+    print(args)
+
     # Initialize the original SAM model and processor
     original_model = SamModel.from_pretrained("facebook/sam-vit-base").to(device)
     processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
@@ -44,16 +46,16 @@ if __name__ == '__main__':
         # Apply subset for shorter training
         if args.train_subset:
             subset_dataset = Subset(train_dataset, indices=range(args.train_subset))
-            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False)
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, collate_fn = custom_collate_fn)
         else:
-            train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
+            train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, collate_fn = custom_collate_fn)
         
         # Apply subset for shorter testing
         if args.test_subset:
             subset_dataset = Subset(test_dataset, indices=range(args.test_subset))
-            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn = custom_collate_fn)
         else:
-            test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True)
+            test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn = custom_collate_fn)
 
     
     elif args.dataset == 'sa1b':
@@ -81,8 +83,8 @@ if __name__ == '__main__':
 
     # Calculate IoUs and average IoU before training
 
-    # miou = test(original_model,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
-    # print(f'original_model pre-train mIoU : {miou}')
+    miou = test(original_model,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
+    print(f'original_model pre-train mIoU : {miou}')
     
     miou = test(submodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
     print(f'submodel pre-train mIoU : {miou}')
@@ -148,16 +150,14 @@ if __name__ == '__main__':
             if ragged_tensors:
                 predicted_masks = [m.squeeze(0) for m in masks]
                 ground_truth_masks = gts
-
-                total_loss = []
+                
+                loss = torch.zeros(1, dtype=predicted_masks[0].dtype, device=device)
 
                 for pred, gt in zip(predicted_masks, gts):
-                    #gt = gt.to(device)
-                    pred, gt = pred.cpu(), gt.cpu()
-                    sample_loss = seg_loss(pred, gt.unsqueeze(0))
-                    total_loss.append(sample_loss)
+                    gt = gt.to(device)
+                    loss += seg_loss(pred.squeeze(0), gt)
 
-                loss = sum(total_loss) / len(total_loss)
+                loss /= len(gts)
 
             #data images have identical shapes (hence stackable)
             else:
