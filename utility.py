@@ -7,24 +7,27 @@ import torchvision.transforms as transforms
 import os
 import json
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import argparse
 import random
 import json
 from pycocotools import mask as coco_mask
+from monai.losses import DiceCELoss
 import tifffile
 from patchify import patchify  #Only to handle large images
 from datasets import Dataset as DatasetX
 from tqdm import tqdm
 import argparse
 import gc
+from statistics import mean
 
 def get_args():
     parser = argparse.ArgumentParser()
     valid_datasets = ['sa1b', 'mito']
     valid_trainables = ['e','m','p', 'em', 'ep','mp','emp']
     parser.add_argument('--dataset', type=str, choices=valid_datasets, default='sa1b', help='Dataset (choices: {%(choices)s}, default: %(default)s)')
-    parser.add_argument('--trainable', type=str, choices=valid_trainables, default='e', help='Choice of SAM modules to train (Encoder, Mask decoder, Both) (choices: {%(choices)s}, default: %(default)s)')
+    parser.add_argument('--trainable', type=str, choices=valid_trainables, default='em', help='Choice of SAM modules to train (Encoder, Mask decoder, Both) (choices: {%(choices)s}, default: %(default)s)')
     parser.add_argument('--train_subset', type=int, default=0, help='Specify training data size. Leave 0 if for default dataset size.')
     parser.add_argument('--test_subset', type=int, default=0, help='Specify testing data size. Leave 0 if for default dataset size.')
     parser.add_argument('--epochs', type=int, default=20, help='Training epochs')
@@ -488,4 +491,115 @@ def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',dis
           break
 
         count += 1
-    return round(sum(mIoU) / len(mIoU), 4) 
+    return round(sum(mIoU) / len(mIoU), 4)
+
+def train(submodel, optimizer, epochs, train_dataloader, processor, device, no_verbose=False):
+    #Training loop
+    seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
+    ragged_tensors = False
+    submodel.to(device)
+    submodel.train()
+    for epoch in range(epochs):
+        epoch_losses = []
+        for (data, gts) in tqdm(train_dataloader, disable=no_verbose):
+
+            #SA1B case rework data returned from the dataloader 
+            if type(data) == list:
+                ragged_tensors = True
+                data = {'pixel_values': torch.stack([d['pixel_values'] for d in data]),
+                 'original_sizes' : torch.stack([d['original_sizes'] for d in data]),
+                 'reshaped_input_sizes' : torch.stack([d['reshaped_input_sizes'] for d in data]),
+                 'input_boxes' : torch.stack([d['input_boxes'] for d in data])}
+
+            # forward pass
+            outputs = submodel(pixel_values=data["pixel_values"].to(device),
+                        input_boxes=data["input_boxes"].to(device),
+                        multimask_output=False)
+
+            
+            masks = processor.image_processor.post_process_masks(
+                outputs.pred_masks, data["original_sizes"], data["reshaped_input_sizes"], binarize=False
+            )
+            
+            #data images have varying shapes (not stackable)
+            if ragged_tensors:
+                predicted_masks = [m.squeeze(0) for m in masks]
+                ground_truth_masks = gts
+                
+                loss = torch.zeros(1, dtype=predicted_masks[0].dtype, device=device)
+
+                for pred, gt in zip(predicted_masks, gts):
+                    gt = gt.to(device)
+                    loss += seg_loss(pred.squeeze(0), gt)
+
+                loss /= len(gts)
+
+            #data images have identical shapes (hence stackable)
+            else:
+                predicted_masks = torch.stack([m.squeeze(0) for m in masks])
+
+                # compute loss
+                #predicted_masks = masks[0] #outputs.pred_masks.squeeze(1)
+                #ground_truth_masks = batch["ground_truth_mask"].float().to(device)
+                ground_truth_masks = gts.float().to(device)
+
+
+                loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+                
+                #Updated Loss
+                # Calculate focal loss and dice loss
+                # loss_focal = focal_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+                # loss_dice = dice_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+                
+                # Combine the losses
+                # loss = 20 * loss_focal + loss_dice
+
+            # backward pass (compute gradients of parameters w.r.t. loss)
+            optimizer.zero_grad()
+            loss.backward()
+
+            # optimize
+            optimizer.step()
+            epoch_losses.append(loss.item())
+
+        print(f'EPOCH: {epoch}')
+        print(f'Mean loss: {mean(epoch_losses)}')
+
+
+def compute_loss(outputs, labels, soft_labels):
+    seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
+    loss = seg_loss(outputs, labels.unsqueeze(1))
+    return loss
+
+def training_step(supernet, model, batch, optimizer, scheduler, device, soft_labels=None):
+    local_grad = {k: v.cpu() for k, v in model.state_dict().items()}
+
+    model.to(device)
+    model = nn.DataParallel(model)
+
+    model.train()
+    optimizer.zero_grad()
+    outputs = model(**batch)
+
+    loss = compute_loss(outputs,
+        labels=batch["labels"] if hasattr(batch, "labels") else None,
+        soft_labels=soft_labels,
+    )
+    # loss.backward()
+    loss.sum().backward()
+    optimizer.step()
+    scheduler.step()
+
+    model = model.module
+
+    with torch.no_grad():
+        for k, v in model.state_dict().items():
+            local_grad[k] = local_grad[k] - v.cpu()
+
+    supernet.apply_grad(local_grad)
+
+    train_metrics = {
+        "train_loss": loss.sum().item(),
+        "params": model.config.num_parameters,
+    }
+    return train_metrics
