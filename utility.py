@@ -21,6 +21,9 @@ from tqdm import tqdm
 import argparse
 import gc
 from statistics import mean
+from torch.optim import Adam
+from torch.optim.lr_scheduler import LambdaLR
+import copy
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -402,6 +405,41 @@ def get_prompt_grid(array_size=256, grid_size=10, batch_size=1):
    
    return input_points
 
+def get_optimizer_and_scheduler(params,lr=1e-5,weight_decay=0):
+    optimizer = Adam(
+        params,
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda x: max(0.1, 0.975**x))
+    return optimizer, scheduler
+
+def get_trainable_parameters(model,trainable):
+    # Freeze modules that are not set as trainable
+    if 'p' not in trainable:
+        for name, param in model.named_parameters():
+            if name.startswith("prompt_encoder"):
+                param.requires_grad_(False)
+    if 'e' not in trainable:
+         for name, param in model.named_parameters():
+            if name.startswith("vision_encoder"):
+                param.requires_grad_(False)
+    if 'm' not in trainable:
+         for name, param in model.named_parameters():
+            if name.startswith("mask_decoder"):
+                param.requires_grad_(False)
+
+    #Select the parameters to train
+    trainable_params = []
+    if 'e' in trainable:
+        trainable_params += list(model.vision_encoder.parameters())
+    if 'm' in trainable:
+        trainable_params += list(model.mask_decoder.parameters())
+    if 'p' in trainable:
+        trainable_params += list(model.prompt_encoder.parameters())
+    
+    return trainable_params
+
 # No need to define a new class
 # Suppose you know the order of your customized Dataset
 def custom_collate_fn(batch):
@@ -493,15 +531,18 @@ def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',dis
         count += 1
     return round(sum(mIoU) / len(mIoU), 4)
 
-def train(submodel, optimizer, epochs, train_dataloader, processor, device, no_verbose=False):
+def train(args):
     #Training loop
+    trainable_params = get_trainable_parameters(args.supermodel, args.trainable)
+    # Initialize the optimizer and the loss function
+    optimizer = Adam(trainable_params, lr=1e-5, weight_decay=0)
     seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
     ragged_tensors = False
-    submodel.to(device)
-    submodel.train()
-    for epoch in range(epochs):
+    args.supermodel.to(args.device)
+    args.supermodel.train()
+    for epoch in range(args.epochs):
         epoch_losses = []
-        for (data, gts) in tqdm(train_dataloader, disable=no_verbose):
+        for (data, gts) in tqdm(args.train_dataloader, disable=args.no_verbose):
 
             #SA1B case rework data returned from the dataloader 
             if type(data) == list:
@@ -512,12 +553,12 @@ def train(submodel, optimizer, epochs, train_dataloader, processor, device, no_v
                  'input_boxes' : torch.stack([d['input_boxes'] for d in data])}
 
             # forward pass
-            outputs = submodel(pixel_values=data["pixel_values"].to(device),
-                        input_boxes=data["input_boxes"].to(device),
+            outputs = args.supermodel(pixel_values=data["pixel_values"].to(args.device),
+                        input_boxes=data["input_boxes"].to(args.device),
                         multimask_output=False)
 
             
-            masks = processor.image_processor.post_process_masks(
+            masks = args.processor.image_processor.post_process_masks(
                 outputs.pred_masks, data["original_sizes"], data["reshaped_input_sizes"], binarize=False
             )
             
@@ -526,10 +567,10 @@ def train(submodel, optimizer, epochs, train_dataloader, processor, device, no_v
                 predicted_masks = [m.squeeze(0) for m in masks]
                 ground_truth_masks = gts
                 
-                loss = torch.zeros(1, dtype=predicted_masks[0].dtype, device=device)
+                loss = torch.zeros(1, dtype=predicted_masks[0].dtype, device=args.device)
 
                 for pred, gt in zip(predicted_masks, gts):
-                    gt = gt.to(device)
+                    gt = gt.to(args.device)
                     loss += seg_loss(pred.squeeze(0), gt)
 
                 loss /= len(gts)
@@ -541,7 +582,7 @@ def train(submodel, optimizer, epochs, train_dataloader, processor, device, no_v
                 # compute loss
                 #predicted_masks = masks[0] #outputs.pred_masks.squeeze(1)
                 #ground_truth_masks = batch["ground_truth_mask"].float().to(device)
-                ground_truth_masks = gts.float().to(device)
+                ground_truth_masks = gts.float().to(args.device)
 
 
                 loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
@@ -565,13 +606,8 @@ def train(submodel, optimizer, epochs, train_dataloader, processor, device, no_v
         print(f'EPOCH: {epoch}')
         print(f'Mean loss: {mean(epoch_losses)}')
 
-
-def compute_loss(outputs, labels, soft_labels):
+def training_step(supermodel, model, data, gts, optimizer, scheduler, processor, device, ragged_tensors, soft_labels=None):
     seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
-    loss = seg_loss(outputs, labels.unsqueeze(1))
-    return loss
-
-def training_step(supernet, model, batch, optimizer, scheduler, device, soft_labels=None):
     local_grad = {k: v.cpu() for k, v in model.state_dict().items()}
 
     model.to(device)
@@ -579,14 +615,38 @@ def training_step(supernet, model, batch, optimizer, scheduler, device, soft_lab
 
     model.train()
     optimizer.zero_grad()
-    outputs = model(**batch)
 
-    loss = compute_loss(outputs,
-        labels=batch["labels"] if hasattr(batch, "labels") else None,
-        soft_labels=soft_labels,
+    # forward pass
+    outputs = model(pixel_values=data["pixel_values"].to(device),
+                input_boxes=data["input_boxes"].to(device),
+                multimask_output=False)
+
+    
+    masks = processor.image_processor.post_process_masks(
+        outputs.pred_masks, data["original_sizes"], data["reshaped_input_sizes"], binarize=False
     )
-    # loss.backward()
-    loss.sum().backward()
+    
+    #data images have varying shapes (not stackable)
+    if ragged_tensors:
+        predicted_masks = [m.squeeze(0) for m in masks]
+        loss = torch.zeros(1, dtype=predicted_masks[0].dtype, device=device)
+
+        for pred, gt in zip(predicted_masks, gts):
+            gt = gt.to(device)
+            loss += seg_loss(pred.squeeze(0), soft_labels if soft_labels else gt)
+
+        loss /= len(gts)
+
+    #data images have identical shapes (hence stackable)
+    else:
+        predicted_masks = torch.stack([m.squeeze(0) for m in masks])
+        gts = gts.float().to(device)
+        loss = seg_loss(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+
+    # backward pass (compute gradients of parameters w.r.t. loss)
+    optimizer.zero_grad()
+    loss.backward()
+    # loss.sum().backward()
     optimizer.step()
     scheduler.step()
 
@@ -596,10 +656,65 @@ def training_step(supernet, model, batch, optimizer, scheduler, device, soft_lab
         for k, v in model.state_dict().items():
             local_grad[k] = local_grad[k] - v.cpu()
 
-    supernet.apply_grad(local_grad)
+    supermodel.apply_grad(local_grad)
 
     train_metrics = {
         "train_loss": loss.sum().item(),
         "params": model.config.num_parameters,
     }
     return train_metrics
+
+
+def train_nas(args):
+    #Training loop
+    # Initialize the optimizer and the loss function
+    ragged_tensors = False
+    args.supermodel.model.to(args.device)
+    args.supermodel.model.train()
+    for epoch in range(args.epochs):
+        print(f'EPOCH: {epoch}')
+        for (data, gts) in tqdm(args.train_dataloader, disable=args.no_verbose):
+
+            #SA1B case rework data returned from the dataloader 
+            if type(data) == list:
+                ragged_tensors = True
+                data = {'pixel_values': torch.stack([d['pixel_values'] for d in data]),
+                 'original_sizes' : torch.stack([d['original_sizes'] for d in data]),
+                 'reshaped_input_sizes' : torch.stack([d['reshaped_input_sizes'] for d in data]),
+                 'input_boxes' : torch.stack([d['input_boxes'] for d in data])}
+            
+            
+            #Train largest submodel (= supernet)
+            # submodel, param, arch = (
+            #         copy.deepcopy(args.supermodel.model),
+            #         args.supermodel.total_params,
+            #         {},
+            #     )
+            submodel, submodel.config.num_parameters, submodel.config.arch = (
+                    copy.deepcopy(args.supermodel.model),
+                    args.supermodel.total_params,
+                    {},
+                )
+            trainable_params = get_trainable_parameters(submodel, args.trainable)
+            optimizer, scheduler = get_optimizer_and_scheduler(trainable_params)
+            train_metrics = training_step(args.supermodel, submodel, data, gts, optimizer, scheduler, 
+                                          args.processor, args.device, ragged_tensors, soft_labels=None)
+            print(f'\tLargest submodel train_meterics : {train_metrics}')
+
+            #Train smallest model
+            submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.smallest_model()
+            trainable_params = get_trainable_parameters(submodel, args.trainable)
+            optimizer, scheduler = get_optimizer_and_scheduler(trainable_params)
+            train_metrics = training_step(args.supermodel, submodel, data, gts, optimizer, scheduler, 
+                                          args.processor, args.device, ragged_tensors, soft_labels=None)
+            print(f'\tSmallest submodel train_meterics : {train_metrics}')
+
+            #Train arbitrary medium sized model
+            submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.random_resource_aware_model()
+            trainable_params = get_trainable_parameters(submodel, args.trainable)
+            optimizer, scheduler = get_optimizer_and_scheduler(trainable_params)
+            train_metrics = training_step(args.supermodel, submodel, data, gts, optimizer, scheduler, 
+                                          args.processor, args.device, ragged_tensors, soft_labels=None)
+            print(f'\tMedium submodel train_meterics : {train_metrics}')
+            
+        
