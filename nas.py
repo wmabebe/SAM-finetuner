@@ -1,9 +1,12 @@
 import os
+import datetime
 from transformers import SamModel, SamConfig, SamProcessor
 from ofm import OFM
 from torch.utils.data import DataLoader, Subset
 from utility import *
+from logger import init_logs, get_logger
 from dataset import SA1BDataset, MitoDataset
+import timeit
 
 if __name__ == '__main__':
 
@@ -12,7 +15,14 @@ if __name__ == '__main__':
     #torch.cuda.empty_cache()
     args = get_args()
 
-    print(args)
+    NOW = str(datetime.datetime.now()).replace(" ","--")
+    log_file_name = 'experiment_log-%s' % (datetime.datetime.now().strftime("%Y-%m-%d-%H:%M-%S"))
+    log_dir = './logs/{}_dataset[{}]_trainable[{}]_epochs[{}]_lr[{}]_local_bs[{}]/'. \
+        format(NOW,args.dataset, args.trainable, args.epochs, args.lr, args.batch_size)
+    
+
+    init_logs(log_file_name, args, log_dir)
+    args.logger = get_logger()
 
     # Initialize the original SAM model and processor
     original_model = SamModel.from_pretrained("facebook/sam-vit-base").to(device)
@@ -27,7 +37,7 @@ if __name__ == '__main__':
     ofm = OFM(original_model, elastic_config=elastic_config)
     args.supermodel = ofm
 
-    print(f'Original model size : {count_parameters(args.supermodel.model)}')
+    args.logger.info(f'Original model size : {count_parameters(args.supermodel.model)} params')
 
     if args.dataset == 'mito':
 
@@ -72,17 +82,37 @@ if __name__ == '__main__':
             test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn = custom_collate_fn)
 
 
-    print(f'trainloader : {len(train_dataloader)}')
-    print(f'testloader : {len(test_dataloader)}')
+    args.logger.info(f'trainloader : {len(train_dataloader)}')
+    args.logger.info(f'testloader : {len(test_dataloader)}')
 
     # Calculate IoUs and average IoU before training
 
     miou = test(args.supermodel.model,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
-    print(f'supermodel pre-train mIoU : {miou}')
+    args.logger.info(f'supermodel pre-NAS mIoU : {miou}%')
 
-    args.train_dataloader =train_dataloader
+    args.train_dataloader = train_dataloader
+    args.test_dataloader = test_dataloader
     args.processor = processor
     args.device = device
-
+    args.log_dir = log_dir
+    
+    args.logger.info(f'NAS Training starts')
+    start = timeit.default_timer()        
     train_nas(args)
+    end = timeit.default_timer()
+    args.logger.info(f'NAS Training ends : {round(end-start,4)} seconds')    
 
+
+    # Load the model configuration
+    model_config = SamConfig.from_pretrained("facebook/sam-vit-base")
+
+    # Create an instance of the model architecture with the loaded configuration
+    saved_supermodel = SamModel(config=model_config)
+    #Update the model by loading the weights from saved file.
+    saved_supermodel.load_state_dict(torch.load(f"{log_dir}{args.dataset}_supermodel_checkpoint.pth"))
+
+    # set the device to cuda if available, otherwise use cpu
+    saved_supermodel.to(device)
+
+    miou = test(saved_supermodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
+    args.logger.info(f'supermodel post-NAS mIoU : {miou}%')

@@ -24,18 +24,22 @@ from statistics import mean
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 import copy
+import timeit
 
 def get_args():
     parser = argparse.ArgumentParser()
     valid_datasets = ['sa1b', 'mito']
     valid_trainables = ['e','m','p', 'em', 'ep','mp','emp']
-    parser.add_argument('--dataset', type=str, choices=valid_datasets, default='sa1b', help='Dataset (choices: {%(choices)s}, default: %(default)s)')
-    parser.add_argument('--trainable', type=str, choices=valid_trainables, default='em', help='Choice of SAM modules to train (Encoder, Mask decoder, Both) (choices: {%(choices)s}, default: %(default)s)')
+    parser.add_argument('--dataset', type=str, choices=valid_datasets, default='sa1b', help='Dataset (choices: {%(choices)s}, default: %(default)s).')
+    parser.add_argument('--trainable', type=str, choices=valid_trainables, default='em', help='Choice of SAM modules to train (Encoder, Mask decoder, Both) (choices: {%(choices)s}, default: %(default)s).')
     parser.add_argument('--train_subset', type=int, default=0, help='Specify training data size. Leave 0 if for default dataset size.')
     parser.add_argument('--test_subset', type=int, default=0, help='Specify testing data size. Leave 0 if for default dataset size.')
-    parser.add_argument('--epochs', type=int, default=20, help='Training epochs')
+    parser.add_argument('--epochs', type=int, default=20, help='Training epochs.')
+    parser.add_argument('--save_interval', type=int, default=10, help='Intervals for saving supermodel checkpoint during training.')
+    parser.add_argument('--lr',type=float,default=1e-5,help='Learning rate.')
     parser.add_argument('--batch_size', type=int, default=2, help='Specify dataloader batch size.')
-    parser.add_argument('--no_verbose', action='store_true', help='Enable to disable verbose mode')
+    parser.add_argument('--no_verbose', action='store_true', help='Enable to disable verbose mode.')
+
 
     args = parser.parse_args()
     return args
@@ -234,7 +238,7 @@ def toBinaryMask(coco, annIds, input_image_size):
     for a in range(len(anns)):
         new_mask = cv2.resize(coco.annToMask(anns[a]), input_image_size)
         
-        print(f'train_mask: {train_mask.shape}, new_mask: {new_mask.shape}')
+        #print(f'train_mask: {train_mask.shape}, new_mask: {new_mask.shape}')
         #Threshold because resizing may cause extraneous values
         new_mask[new_mask >= 0.5] = 1
         new_mask[new_mask < 0.5] = 0
@@ -452,6 +456,7 @@ def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',dis
     mIoU = []
     count = 0
     model.eval()
+    model = nn.DataParallel(model)
     model = model.to(device)
     for (data, gts) in tqdm(dataloader, disable=disable_verbose):
 
@@ -470,8 +475,10 @@ def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',dis
                         multimask_output=False)
             # outputs = my_mito_model(**inputs, multimask_output=False)
         
+        pred_masks = outputs.pred_masks.to('cpu')
+
         masks = processor.image_processor.post_process_masks(
-            outputs.pred_masks, data["original_sizes"], data["reshaped_input_sizes"]
+            pred_masks, data["original_sizes"], data["reshaped_input_sizes"]
         )
 
         #If images have varying shapes pass (list,list) to compute_miou
@@ -529,6 +536,9 @@ def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',dis
           break
 
         count += 1
+
+    model = model.module
+    model = model.to('cpu')
     return round(sum(mIoU) / len(mIoU), 4)
 
 def train(args):
@@ -651,6 +661,7 @@ def training_step(supermodel, model, data, gts, optimizer, scheduler, processor,
     scheduler.step()
 
     model = model.module
+    model = model.to('cpu')
 
     with torch.no_grad():
         for k, v in model.state_dict().items():
@@ -664,16 +675,31 @@ def training_step(supermodel, model, data, gts, optimizer, scheduler, processor,
     }
     return train_metrics
 
+def single_step(args,submodel,data,gts,ragged_tensors, model_size, do_test=False):
+    trainable_params = get_trainable_parameters(submodel, args.trainable)
+    optimizer, scheduler = get_optimizer_and_scheduler(trainable_params)
+    start_train = timeit.default_timer()
+    metrics = training_step(args.supermodel, submodel, data, gts, optimizer, scheduler, 
+                                    args.processor, args.device, ragged_tensors, soft_labels=None)
+    end_train = timeit.default_timer()
+    if do_test:
+        start_test = timeit.default_timer()
+        miou = test(args.supermodel.model,args.test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=args.processor)
+        end_test = timeit.default_timer()
+        metrics['test_miou'] = miou
+        args.logger.info(f'\t{model_size} submodel train time : {round(end_train-start_train,4)}, test time {round(end_test-start_test,4)}, metrics {metrics}')
+    else:
+        args.logger.info(f'\t{model_size} submodel train time : {round(end_train-start_train,4)}, metrics {metrics}')
+
 
 def train_nas(args):
     #Training loop
     # Initialize the optimizer and the loss function
     ragged_tensors = False
-    args.supermodel.model.to(args.device)
-    args.supermodel.model.train()
     for epoch in range(args.epochs):
-        print(f'EPOCH: {epoch}')
-        for (data, gts) in tqdm(args.train_dataloader, disable=args.no_verbose):
+        args.logger.info(f'EPOCH {epoch}: starts')
+        start_epoch = timeit.default_timer()
+        for idx, (data, gts) in enumerate(tqdm(args.train_dataloader, disable=args.no_verbose)):
 
             #SA1B case rework data returned from the dataloader 
             if type(data) == list:
@@ -683,38 +709,37 @@ def train_nas(args):
                  'reshaped_input_sizes' : torch.stack([d['reshaped_input_sizes'] for d in data]),
                  'input_boxes' : torch.stack([d['input_boxes'] for d in data])}
             
+            #set to True to test the submodels after training step
+            do_test = (idx == len(args.train_dataloader) - 1)
+            
+            #Intervals at which to save the model checkpoint
+            save_interval = len(args.train_dataloader) // args.save_interval if len(args.train_dataloader) > 10 else 1
+            do_save = ((idx + 1) % save_interval == 0)
             
             #Train largest submodel (= supernet)
-            # submodel, param, arch = (
-            #         copy.deepcopy(args.supermodel.model),
-            #         args.supermodel.total_params,
-            #         {},
-            #     )
             submodel, submodel.config.num_parameters, submodel.config.arch = (
                     copy.deepcopy(args.supermodel.model),
                     args.supermodel.total_params,
                     {},
                 )
-            trainable_params = get_trainable_parameters(submodel, args.trainable)
-            optimizer, scheduler = get_optimizer_and_scheduler(trainable_params)
-            train_metrics = training_step(args.supermodel, submodel, data, gts, optimizer, scheduler, 
-                                          args.processor, args.device, ragged_tensors, soft_labels=None)
-            print(f'\tLargest submodel train_meterics : {train_metrics}')
+            single_step(args,submodel,data,gts,ragged_tensors,model_size='Largest',do_test=do_test)
 
             #Train smallest model
             submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.smallest_model()
-            trainable_params = get_trainable_parameters(submodel, args.trainable)
-            optimizer, scheduler = get_optimizer_and_scheduler(trainable_params)
-            train_metrics = training_step(args.supermodel, submodel, data, gts, optimizer, scheduler, 
-                                          args.processor, args.device, ragged_tensors, soft_labels=None)
-            print(f'\tSmallest submodel train_meterics : {train_metrics}')
+            single_step(args,submodel,data,gts,ragged_tensors,model_size='Smallest',do_test=do_test)
 
             #Train arbitrary medium sized model
             submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.random_resource_aware_model()
-            trainable_params = get_trainable_parameters(submodel, args.trainable)
-            optimizer, scheduler = get_optimizer_and_scheduler(trainable_params)
-            train_metrics = training_step(args.supermodel, submodel, data, gts, optimizer, scheduler, 
-                                          args.processor, args.device, ragged_tensors, soft_labels=None)
-            print(f'\tMedium submodel train_meterics : {train_metrics}')
-            
+            single_step(args,submodel,data,gts,ragged_tensors,model_size='Medium',do_test=do_test)
+
+            # Save the supermodel state dictionary to a file
+            if do_save:
+                torch.save(args.supermodel.model.state_dict(), f"{args.log_dir}{args.dataset}_supermodel_checkpoint.pth")
+                args.logger.info(f'\tInterval {(idx + 1) // save_interval}: Model checkpoint saved.')
+
+        end_epoch = timeit.default_timer()
+
+        # Save the supermodel state dictionary to a file
+        torch.save(args.supermodel.model.state_dict(), f"{args.log_dir}{args.dataset}_supermodel_checkpoint.pth")
+        args.logger.info(f'EPOCH {epoch}: ends {round(end_epoch-start_epoch,4)} seconds. Model checkpoint saved.')   
         
