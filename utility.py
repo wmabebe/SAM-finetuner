@@ -39,6 +39,7 @@ def get_args():
     parser.add_argument('--lr',type=float,default=1e-5,help='Learning rate.')
     parser.add_argument('--batch_size', type=int, default=2, help='Specify dataloader batch size.')
     parser.add_argument('--no_verbose', action='store_true', help='Enable to disable verbose mode.')
+    parser.add_argument('--crop', action='store_true', help='Crop SA1B images for training with larger batch sizes.')
 
 
     args = parser.parse_args()
@@ -734,12 +735,12 @@ def train_nas(args):
 
             # Save the supermodel state dictionary to a file
             if do_save:
-                torch.save(args.supermodel.model.state_dict(), f"{args.log_dir}{args.dataset}_supermodel_checkpoint.pth")
+                args.supermodel.save_ckpt(os.path.join({args.log_dir}, f"{args.dataset}_supermodel_checkpoint"))
                 args.logger.info(f'\tInterval {(idx + 1) // save_interval}: Model checkpoint saved.')
 
         end_epoch = timeit.default_timer()
 
         # Save the supermodel state dictionary to a file
-        torch.save(args.supermodel.model.state_dict(), f"{args.log_dir}{args.dataset}_supermodel_checkpoint.pth")
+        args.supermodel.save_ckpt(os.path.join({args.log_dir}, f"{args.dataset}_supermodel_checkpoint"))
         args.logger.info(f'EPOCH {epoch}: ends {round(end_epoch-start_epoch,4)} seconds. Model checkpoint saved.')   
         

@@ -1,95 +1,83 @@
-from sklearn.metrics import confusion_matrix
-import matplotlib as plt
-import tifffile
-import random
-import torch
-import numpy as np
+import os
+import datetime
 from transformers import SamModel, SamConfig, SamProcessor
+from ofm import OFM
+from torch.utils.data import DataLoader, Subset
+from utility import *
+from logger import init_logs, get_logger
+from dataset import SA1BDataset, MitoDataset
+import timeit
 
-from transformers import SamModel
+if __name__ == '__main__':
 
-#Get bounding boxes from mask.
-def get_bounding_box(ground_truth_map):
-  # get bounding box from mask
-  y_indices, x_indices = np.where(ground_truth_map > 0)
-  x_min, x_max = np.min(x_indices), np.max(x_indices)
-  y_min, y_max = np.min(y_indices), np.max(y_indices)
-  # add perturbation to bounding box coordinates
-  H, W = ground_truth_map.shape
-  x_min = max(0, x_min - np.random.randint(0, 20))
-  x_max = min(W, x_max + np.random.randint(0, 20))
-  y_min = max(0, y_min - np.random.randint(0, 20))
-  y_max = min(H, y_max + np.random.randint(0, 20))
-  bbox = [x_min, y_min, x_max, y_max]
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-  return bbox
+    #torch.cuda.empty_cache()
+    args = get_args()
 
-large_test_images = tifffile.imread("datasets/mitochondria/testing.tif")
-large_test_image = large_test_images[1]
+    # Initialize the original SAM model and processor
+    processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
 
-model_config = SamConfig.from_pretrained("facebook/sam-vit-base")
-processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+    print(args)
 
-# Create an instance of the model architecture with the loaded configuration
-my_mito_model = SamModel(config=model_config)
-#Update the model by loading the weights from saved file.
-my_mito_model.load_state_dict(torch.load("models/mito_model_checkpoint.pth"))
+    if args.dataset == 'mito':
 
-# set the device to cuda if available, otherwise use cpu
-device = "cuda" if torch.cuda.is_available() else "cpu"
-my_mito_model.to(device)
+        # Create an instance of the SAMDataset
+        train_dataset = load_dataset("datasets/mitochondria/training.tif", "datasets/mitochondria/training_groundtruth.tif")
+        test_dataset = load_dataset("datasets/mitochondria/testing.tif", "datasets/mitochondria/testing_groundtruth.tif")
+        train_dataset = MitoDataset(dataset=train_dataset, processor=processor)
+        test_dataset = MitoDataset(dataset=test_dataset, processor=processor)
 
-# Create an empty list to store results and mIoU values
-all_test_results = []
-all_miou_values = []
+        # Apply subset for shorter training
+        if args.train_subset:
+            subset_dataset = Subset(train_dataset, indices=range(args.train_subset))
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False)
+        else:
+            train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
+        
+        # Apply subset for shorter testing
+        if args.test_subset:
+            subset_dataset = Subset(test_dataset, indices=range(args.test_subset))
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        else:
+            test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True)
 
-# Iterate over each test image
-for test_image_idx in range(len(large_test_images)):
-    # Load a test image
-    test_image = large_test_images[test_image_idx]
+    
+    elif args.dataset == 'sa1b':
+        dataset = SA1BDataset('SA1B', processor=processor, do_crop=args.crop)
 
-    # Get bounding box prompt based on ground truth segmentation map
-    ground_truth_mask = np.zeros_like(test_image)  # Assuming no ground truth mask is available
-    prompt = get_bounding_box(ground_truth_mask)
+        # Apply subset for shorter training
+        if args.train_subset:
+            subset_dataset = Subset(dataset, indices=range(0,args.train_subset,1))
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, collate_fn = custom_collate_fn) #collate_fn = custom_collate_fn
+        
+        else:
+            subset_dataset = Subset(dataset, indices=range(0,10000,1))
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, collate_fn = custom_collate_fn)
+        
+        if args.test_subset:
+            subset_dataset = Subset(dataset, indices=range(args.train_subset,args.train_subset + args.test_subset,1))
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn = custom_collate_fn) #collate_fn = custom_collate_fn
+        else:
+            subset_dataset = Subset(dataset, indices=range(10000,len(dataset),1))
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn = custom_collate_fn)
 
-    # Prepare image + box prompt for the model
-    inputs = processor(test_image, input_boxes=[[prompt]], return_tensors="pt")
 
-    # Move the input tensor to the GPU if it's not already there
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    print(f'trainloader : {len(train_dataloader)}')
+    print(f'testloader : {len(test_dataloader)}')
 
-    # Set the model to evaluation mode
-    my_mito_model.eval()
+    # Load the model configuration
+    saved_supermodel = SamModel.from_pretrained("logs/2024-04-16--19:37:57.149174_dataset[sa1b]_trainable[em]_epochs[1]_lr[1e-05]_local_bs[8]/sa1b_supermodel_checkpoint")
+ 
+    miou = test(saved_supermodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
+    print(f'Supermodel from file {count_parameters(saved_supermodel)}: mIoU = {miou}%')
 
-    # Forward pass
-    with torch.no_grad():
-        outputs = my_mito_model(**inputs, multimask_output=False)
+    ofm = OFM(saved_supermodel)
 
-    # Apply sigmoid
-    test_seg_prob = torch.sigmoid(outputs.pred_masks.squeeze(1))
-    # Convert soft mask to hard mask
-    test_seg_prob = test_seg_prob.cpu().numpy().squeeze()
-    test_seg = (test_seg_prob > 0.5).astype(np.uint8)
+    submodel, params, config = ofm.smallest_model()
+    miou = test(submodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
+    print(f'Smallest from file {count_parameters(submodel)} params: mIoU = {miou}%')
 
-    # Compute mIoU
-    ground_truth_flat = ground_truth_mask.flatten()
-    test_seg_flat = test_seg.flatten()
-
-    # Using confusion matrix to compute mIoU
-    cm = confusion_matrix(ground_truth_flat, test_seg_flat, labels=[0, 1])
-    intersection = np.diag(cm)
-    union = np.sum(cm, axis=(0, 1)) + 1e-10  # Add a small epsilon to avoid division by zero
-    iou = intersection / union
-    miou = np.mean(iou)
-
-    # Store the results and mIoU value
-    all_test_results.append({
-        "test_image": test_image,
-        "test_seg_prob": test_seg_prob,
-        "test_seg": test_seg
-    })
-    all_miou_values.append(miou)
-
-# Display mIoU values for all test images
-for idx, miou_value in enumerate(all_miou_values):
-    print(f"mIoU for Test Image {idx + 1}: {miou_value}")
+    submodel, params, config = ofm.random_resource_aware_model()
+    miou = test(submodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
+    print(f'Medium from file {count_parameters(submodel)} params: mIoU = {miou}%')

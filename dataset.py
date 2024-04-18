@@ -10,14 +10,11 @@ from pycocotools import mask as mask_utils
 
 
 class SA1BDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_directory, processor):
+    def __init__(self, dataset_directory, processor, do_crop=False):
         self.datadir = dataset_directory
         self.processor = processor
         self.imgs, self.labels = SA1BDataset.get_image_json_pairs(self.datadir)
-        self.target_transform = transforms.Compose([
-                                 transforms.Resize((1024, 1024)),  # Resize to 1024x1024
-                                transforms.ToTensor()  # Convert to tensor
-                                ])
+        self.do_crop = do_crop
 
     def __len__(self):
         return len(self.imgs)
@@ -27,6 +24,29 @@ class SA1BDataset(torch.utils.data.Dataset):
         image = np.array(image)
         image = np.moveaxis(image, -1, 0)
         return image
+
+    @staticmethod
+    #Crop region around masked object
+    def cropper(image, ground_truth_map,padding=50):
+        # get bounding box from mask
+        y_indices, x_indices = np.where(ground_truth_map > 0)
+        x_min, x_max = np.min(x_indices), np.max(x_indices)
+        y_min, y_max = np.min(y_indices), np.max(y_indices)
+        # Pad the crop
+        H, W = ground_truth_map.shape
+        x_min = max(0, x_min - padding)
+        x_max = min(W, x_max + padding)
+        y_min = max(0, y_min - padding)
+        y_max = min(H, y_max + padding)
+
+        #For color image
+        if len(image.shape) > 2:
+            cropped_image = image[:, y_min:y_max, x_min:x_max]
+        #For grayscale mask
+        else:
+            cropped_image = image[y_min:y_max, x_min:x_max]
+
+        return cropped_image
     
     @staticmethod
     #Get bounding boxes from mask.
@@ -73,6 +93,12 @@ class SA1BDataset(torch.utils.data.Dataset):
         #Just pick the first mask
         mask = masks[0]
         bin_ground_truth_mask = mask_utils.decode(mask['segmentation'])
+
+        #Crop image and mask
+        if self.do_crop:
+            image = SA1BDataset.cropper(image,bin_ground_truth_mask)
+            bin_ground_truth_mask = SA1BDataset.cropper(bin_ground_truth_mask,bin_ground_truth_mask)
+
         bbox_prompt = SA1BDataset.get_bounding_box(bin_ground_truth_mask)
         bin_ground_truth_mask = torch.tensor(bin_ground_truth_mask)
         

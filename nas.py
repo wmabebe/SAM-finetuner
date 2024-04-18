@@ -25,7 +25,7 @@ if __name__ == '__main__':
     args.logger = get_logger()
 
     # Initialize the original SAM model and processor
-    original_model = SamModel.from_pretrained("facebook/sam-vit-base").to(device)
+    original_model = SamModel.from_pretrained("facebook/sam-vit-base")
     processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
 
     # OFM configuration and submodel initialization
@@ -63,7 +63,7 @@ if __name__ == '__main__':
 
     
     elif args.dataset == 'sa1b':
-        dataset = SA1BDataset('SA1B', processor=processor)
+        dataset = SA1BDataset('SA1B', processor=processor, do_crop=args.crop)
 
         # Apply subset for shorter training
         if args.train_subset:
@@ -85,6 +85,7 @@ if __name__ == '__main__':
     args.logger.info(f'trainloader : {len(train_dataloader)}')
     args.logger.info(f'testloader : {len(test_dataloader)}')
 
+
     # Calculate IoUs and average IoU before training
 
     miou = test(args.supermodel.model,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
@@ -103,16 +104,8 @@ if __name__ == '__main__':
     args.logger.info(f'NAS Training ends : {round(end-start,4)} seconds')    
 
 
-    # Load the model configuration
-    model_config = SamConfig.from_pretrained("facebook/sam-vit-base")
-
-    # Create an instance of the model architecture with the loaded configuration
-    saved_supermodel = SamModel(config=model_config)
-    #Update the model by loading the weights from saved file.
-    saved_supermodel.load_state_dict(torch.load(f"{log_dir}{args.dataset}_supermodel_checkpoint.pth"))
-
-    # set the device to cuda if available, otherwise use cpu
-    saved_supermodel.to(device)
+    # Load the model configuration    
+    saved_supermodel = SamModel.from_pretrained(os.path.join({args.log_dir}, f"{args.dataset}_supermodel_checkpoint"))
 
     miou = test(saved_supermodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
-    args.logger.info(f'supermodel post-NAS mIoU : {miou}%')
+    args.logger.info(f'saved_supermodel post-NAS mIoU : {miou}%')
