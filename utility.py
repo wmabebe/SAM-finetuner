@@ -685,7 +685,7 @@ def single_step(args,submodel,data,gts,ragged_tensors, model_size, do_test=False
     end_train = timeit.default_timer()
     if do_test:
         start_test = timeit.default_timer()
-        miou = test(args.supermodel.model,args.test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=args.processor)
+        miou = test(submodel,args.test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=args.processor)
         end_test = timeit.default_timer()
         metrics['test_miou'] = miou
         args.logger.info(f'\t{model_size} submodel train time : {round(end_train-start_train,4)}, test time {round(end_test-start_test,4)}, metrics {metrics}')
@@ -735,12 +735,12 @@ def train_nas(args):
 
             # Save the supermodel state dictionary to a file
             if do_save:
-                args.supermodel.save_ckpt(os.path.join({args.log_dir}, f"{args.dataset}_supermodel_checkpoint"))
+                args.supermodel.save_ckpt(f'{args.log_dir}')
                 args.logger.info(f'\tInterval {(idx + 1) // save_interval}: Model checkpoint saved.')
 
         end_epoch = timeit.default_timer()
 
         # Save the supermodel state dictionary to a file
-        args.supermodel.save_ckpt(os.path.join({args.log_dir}, f"{args.dataset}_supermodel_checkpoint"))
+        args.supermodel.save_ckpt(f'{args.log_dir}')
         args.logger.info(f'EPOCH {epoch}: ends {round(end_epoch-start_epoch,4)} seconds. Model checkpoint saved.')   
         

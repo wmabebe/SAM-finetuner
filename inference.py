@@ -67,12 +67,12 @@ if __name__ == '__main__':
     print(f'testloader : {len(test_dataloader)}')
 
     # Load the model configuration
-    saved_supermodel = SamModel.from_pretrained("logs/2024-04-16--19:37:57.149174_dataset[sa1b]_trainable[em]_epochs[1]_lr[1e-05]_local_bs[8]/sa1b_supermodel_checkpoint")
- 
-    miou = test(saved_supermodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
-    print(f'Supermodel from file {count_parameters(saved_supermodel)}: mIoU = {miou}%')
+    saved_supermodel = SamModel.from_pretrained("logs/2024-04-18--17:05:20.238154_dataset[sa1b]_trainable[em]_epochs[100]_lr[1e-05]_local_bs[24]")
 
     ofm = OFM(saved_supermodel)
+
+    miou = test(ofm.model,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
+    print(f'Supermodel from file {count_parameters(saved_supermodel)}: mIoU = {miou}%')
 
     submodel, params, config = ofm.smallest_model()
     miou = test(submodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)

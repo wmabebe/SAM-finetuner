@@ -102,10 +102,3 @@ if __name__ == '__main__':
     train_nas(args)
     end = timeit.default_timer()
     args.logger.info(f'NAS Training ends : {round(end-start,4)} seconds')    
-
-
-    # Load the model configuration    
-    saved_supermodel = SamModel.from_pretrained(os.path.join({args.log_dir}, f"{args.dataset}_supermodel_checkpoint"))
-
-    miou = test(saved_supermodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
-    args.logger.info(f'saved_supermodel post-NAS mIoU : {miou}%')
