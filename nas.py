@@ -5,8 +5,10 @@ from ofm import OFM
 from torch.utils.data import DataLoader, Subset
 from utility import *
 from logger import init_logs, get_logger
-from dataset import SA1BDataset, MitoDataset
+from dataset import SA1BDataset, MitoDataset #, COCOSegmentation
+from coco_dataset import COCOSegmentation
 import timeit
+
 
 if __name__ == '__main__':
 
@@ -24,18 +26,28 @@ if __name__ == '__main__':
     init_logs(log_file_name, args, log_dir)
     args.logger = get_logger()
 
+    #Initialize encoder
+    # huge_model = SamModel.from_pretrained("facebook/sam-vit-huge")
+    # huge_processor = SamProcessor.from_pretrained("facebook/sam-vit-huge")
+
     # Initialize the original SAM model and processor
     original_model = SamModel.from_pretrained("facebook/sam-vit-base")
     processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
 
     # OFM configuration and submodel initialization
     elastic_config = {
-        "atten_out_space": [256,512,768],
-        "inter_hidden_space": [512, 768, 1024],
+        "atten_out_space": [512,768], #must be divisbly by num_heads==12
+        "inter_hidden_space": [64, 128, 512],
         "residual_hidden_space": [512, 768, 1024],
+    }
+    elastic_config = {
+        "atten_out_space": [768], #Don't go over 768
+        "inter_hidden_space": [768,1020,1536], #Reduce for minimizing model size
+        "residual_hidden_space": [768,1020,1536],
     }
     ofm = OFM(original_model, elastic_config=elastic_config)
     args.supermodel = ofm
+    args.pretrained = original_model
 
     args.logger.info(f'Original model size : {count_parameters(args.supermodel.model)} params')
 
@@ -63,33 +75,62 @@ if __name__ == '__main__':
 
     
     elif args.dataset == 'sa1b':
-        dataset = SA1BDataset('SA1B', processor=processor, do_crop=args.crop)
+        train_dataset = SA1BDataset('datasets/SA1B', processor=processor, do_crop=args.crop,label='rand')
+        test_dataset = SA1BDataset('datasets/SA1B', processor=processor, do_crop=args.crop)
+
+        # Apply subset for shorter training
+        if args.train_subset:
+            subset_dataset = Subset(train_dataset, indices=range(0,args.train_subset,1))
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, collate_fn = sa1b_collate_fn) #collate_fn = sa1b_collate_fn
+        
+        else:
+            subset_dataset = Subset(train_dataset, indices=range(0,10000,1))
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, collate_fn = sa1b_collate_fn)
+        
+        if args.test_subset:
+            subset_dataset = Subset(test_dataset, indices=range(args.train_subset,args.train_subset + args.test_subset,1))
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn = sa1b_collate_fn) #collate_fn = sa1b_collate_fn
+        else:
+            subset_dataset = Subset(test_dataset, indices=range(10000,len(test_dataset),1))
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn = sa1b_collate_fn)
+
+    elif args.dataset == 'coco':
+        #dataset = COCOSegmentation('datasets/coco','val', processor=processor)
+        args.base_size = 513
+        args.crop_size = 513
+        dataset = COCOSegmentation(args,'datasets/coco','val', '2017', processor=processor)
+        #test_dataset = COCOSegmentation('datasets/coco','val')
 
         # Apply subset for shorter training
         if args.train_subset:
             subset_dataset = Subset(dataset, indices=range(0,args.train_subset,1))
-            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, collate_fn = custom_collate_fn) #collate_fn = custom_collate_fn
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=none_skipper_collate) #collate_fn = custom_collate_fn
         
         else:
-            subset_dataset = Subset(dataset, indices=range(0,10000,1))
-            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, collate_fn = custom_collate_fn)
+            subset_dataset = Subset(dataset, indices=range(0,3000,1))
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, collate_fn=none_skipper_collate)
         
         if args.test_subset:
             subset_dataset = Subset(dataset, indices=range(args.train_subset,args.train_subset + args.test_subset,1))
-            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn = custom_collate_fn) #collate_fn = custom_collate_fn
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn=none_skipper_collate) #collate_fn = custom_collate_fn
         else:
-            subset_dataset = Subset(dataset, indices=range(10000,len(dataset),1))
-            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn = custom_collate_fn)
+            subset_dataset = Subset(dataset, indices=range(3000,len(dataset),1))
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn=none_skipper_collate)
 
-
-    args.logger.info(f'trainloader : {len(train_dataloader)}')
-    args.logger.info(f'testloader : {len(test_dataloader)}')
-
+    #args.logger.info(f'Dataset : {len(dataset)}')
+    args.logger.info(f'trainloader : {len(train_dataloader)} x batch_size : {args.batch_size}')
+    args.logger.info(f'testloader : {len(test_dataloader)} x batch_size : {args.batch_size}')
 
     # Calculate IoUs and average IoU before training
 
-    miou = test(args.supermodel.model,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
+    miou = test(args.supermodel.model,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
     args.logger.info(f'supermodel pre-NAS mIoU : {miou}%')
+    submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.smallest_model()
+    miou = test(submodel,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    args.logger.info(f'smallest pre-NAS mIoU : {miou}%')
+    submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.random_resource_aware_model()
+    miou = test(submodel,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    args.logger.info(f'medium pre-NAS mIoU : {miou}%')
 
     args.train_dataloader = train_dataloader
     args.test_dataloader = test_dataloader

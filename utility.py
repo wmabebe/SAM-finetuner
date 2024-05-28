@@ -13,7 +13,7 @@ import argparse
 import random
 import json
 from pycocotools import mask as coco_mask
-from monai.losses import DiceCELoss
+from monai.losses import DiceLoss, FocalLoss, DiceFocalLoss, DiceCELoss
 import tifffile
 from patchify import patchify  #Only to handle large images
 from datasets import Dataset as DatasetX
@@ -25,18 +25,26 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 import copy
 import timeit
+from torch.utils.data.dataloader import default_collate
 
 def get_args():
     parser = argparse.ArgumentParser()
-    valid_datasets = ['sa1b', 'mito']
+    valid_datasets = ['sa1b', 'mito', 'coco']
     valid_trainables = ['e','m','p', 'em', 'ep','mp','emp']
+    valid_submodels = ['lsm','ls','lm','sm','m','s']
+    train_prompts = ['p','b','p+b','pob']
+    test_prompts = ['p','b','p+b']
     parser.add_argument('--dataset', type=str, choices=valid_datasets, default='sa1b', help='Dataset (choices: {%(choices)s}, default: %(default)s).')
     parser.add_argument('--trainable', type=str, choices=valid_trainables, default='em', help='Choice of SAM modules to train (Encoder, Mask decoder, Both) (choices: {%(choices)s}, default: %(default)s).')
+    parser.add_argument('--sandwich', type=str, choices=valid_submodels, default='lsm', help='Sandwich configuration: submodels to train (Largest, Smallest, Medium) (choices: {%(choices)s}, default: %(default)s).')
+    parser.add_argument('--train_prompt', type=str, choices=train_prompts, default='pb', help='Prompts used for trainig (Point, Box, Together, Either/Or) (choices: {%(choices)s}, default: %(default)s).')
+    parser.add_argument('--test_prompt', type=str, choices=test_prompts, default='b', help='Prompts used for testing (Point, Box, Together) (choices: {%(choices)s}, default: %(default)s).')
     parser.add_argument('--train_subset', type=int, default=0, help='Specify training data size. Leave 0 if for default dataset size.')
     parser.add_argument('--test_subset', type=int, default=0, help='Specify testing data size. Leave 0 if for default dataset size.')
     parser.add_argument('--epochs', type=int, default=20, help='Training epochs.')
     parser.add_argument('--save_interval', type=int, default=10, help='Intervals for saving supermodel checkpoint during training.')
-    parser.add_argument('--lr',type=float,default=1e-5,help='Learning rate.')
+    parser.add_argument('--lr',type=float,default=1e-5,help='Learning rate.') #mito lr=1e-5
+    parser.add_argument('--weight_decay',type=float,default=0,help='Weight decay.')
     parser.add_argument('--batch_size', type=int, default=2, help='Specify dataloader batch size.')
     parser.add_argument('--no_verbose', action='store_true', help='Enable to disable verbose mode.')
     parser.add_argument('--crop', action='store_true', help='Crop SA1B images for training with larger batch sizes.')
@@ -296,11 +304,11 @@ def get_ground_truth_masks(mask_path):
         binary_masks.append(binary_mask)
     return binary_masks
 
-def calculate_metrics(pred_mask, gt_mask):
-    intersection = np.logical_and(pred_mask, gt_mask).sum()
-    union = np.logical_or(pred_mask, gt_mask).sum()
-    iou = intersection / union if union != 0 else 0
-    return iou
+# def calculate_metrics(pred_mask, gt_mask):
+#     intersection = np.logical_and(pred_mask, gt_mask).sum()
+#     union = np.logical_or(pred_mask, gt_mask).sum()
+#     iou = intersection / union if union != 0 else 0
+#     return iou
 
 def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
     BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
@@ -447,12 +455,17 @@ def get_trainable_parameters(model,trainable):
 
 # No need to define a new class
 # Suppose you know the order of your customized Dataset
-def custom_collate_fn(batch):
+def sa1b_collate_fn(batch):
     return list(map(list, zip(*batch)))  # transpose list of list
 
+#Collate for skipping blank masks in coco 
+def none_skipper_collate(batch):
+    "Puts each data field into a tensor with outer dimension batch size"
+    batch = list(filter(lambda x : x is not None, batch))
+    return default_collate(batch)
 
 #Test model performance on given dataset
-def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',disable_verbose=False,processor=None):
+def test(model,dataloader,size=10000,device='cuda',disable_verbose=False,processor=None, prompt='b'):
     ragged_tensors = False
     mIoU = []
     count = 0
@@ -461,19 +474,48 @@ def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',dis
     model = model.to(device)
     for (data, gts) in tqdm(dataloader, disable=disable_verbose):
 
+        # print(f'data : {data}')
+        # print(f'gts : {gts}')
+        # exit()
+
+        # Convert torch tensor to NumPy array
+        # idx = random.randint(0, 31)
+        # numpy_array = data[idx].squeeze().numpy()  # Squeeze the tensor to remove the batch dimension
+        # plt.imshow(numpy_array)
+        # plt.axis('off')  # Turn off axis
+        # plt.title('Image')  # Set title
+        # plt.savefig('coco_image.jpg', bbox_inches='tight', pad_inches=0)
+
+        # numpy_array = gts[idx].squeeze().numpy()  # Squeeze the tensor to remove the batch dimension
+        # plt.imshow(numpy_array)
+        # plt.axis('off')  # Turn off axis
+        # plt.title('Mask')  # Set title
+        # plt.savefig('coco_mask.jpg', bbox_inches='tight', pad_inches=0)
+
         #SA1B case rework data returned from the dataloader
         if type(data) == list:
             ragged_tensors = True
             data = {'pixel_values': torch.stack([d['pixel_values'] for d in data]),
                  'original_sizes' : torch.stack([d['original_sizes'] for d in data]),
                  'reshaped_input_sizes' : torch.stack([d['reshaped_input_sizes'] for d in data]),
-                 'input_boxes' : torch.stack([d['input_boxes'] for d in data])}
+                 'input_boxes' : torch.stack([d['input_boxes'] for d in data]),
+                 'input_points' : torch.stack([d['input_points'] for d in data])}
 
         # forward pass
         with torch.no_grad():
-            outputs = model(pixel_values=data["pixel_values"].to(device),
-                        input_boxes=data["input_boxes"].to(device),
-                        multimask_output=False)
+
+            #forward with point only
+            if prompt == 'p':
+                outputs = model(pixel_values=data["pixel_values"].to(device),
+                            input_points=data["input_points"].to(device),
+                            multimask_output=False)
+            
+            #forward with box only
+            elif prompt == 'b':
+                outputs = model(pixel_values=data["pixel_values"].to(device),
+                                input_boxes=data["input_boxes"].to(device),
+                                multimask_output=False)
+
             # outputs = my_mito_model(**inputs, multimask_output=False)
         
         pred_masks = outputs.pred_masks.to('cpu')
@@ -542,18 +584,18 @@ def test(model,dataloader,size=10000,grid_size=10,batch_size=2,device='cuda',dis
     model = model.to('cpu')
     return round(sum(mIoU) / len(mIoU), 4)
 
-def train(args):
+def train(submodel, optimizer, epochs, train_dataloader, processor, device, no_verbose=True):
     #Training loop
-    trainable_params = get_trainable_parameters(args.supermodel, args.trainable)
     # Initialize the optimizer and the loss function
-    optimizer = Adam(trainable_params, lr=1e-5, weight_decay=0)
     seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
+    dice_focal = DiceFocalLoss(sigmoid=True, squared_pred=True, reduction='mean',lambda_focal=0.95,lambda_dice=0.05)
+
     ragged_tensors = False
-    args.supermodel.to(args.device)
-    args.supermodel.train()
-    for epoch in range(args.epochs):
+    submodel.to(device)
+    submodel.train()
+    for epoch in range(epochs):
         epoch_losses = []
-        for (data, gts) in tqdm(args.train_dataloader, disable=args.no_verbose):
+        for (data, gts) in tqdm(train_dataloader, disable=no_verbose):
 
             #SA1B case rework data returned from the dataloader 
             if type(data) == list:
@@ -564,12 +606,12 @@ def train(args):
                  'input_boxes' : torch.stack([d['input_boxes'] for d in data])}
 
             # forward pass
-            outputs = args.supermodel(pixel_values=data["pixel_values"].to(args.device),
-                        input_boxes=data["input_boxes"].to(args.device),
+            outputs = submodel(pixel_values=data["pixel_values"].to(device),
+                        input_boxes=data["input_boxes"].to(device),
                         multimask_output=False)
 
             
-            masks = args.processor.image_processor.post_process_masks(
+            masks = processor.image_processor.post_process_masks(
                 outputs.pred_masks, data["original_sizes"], data["reshaped_input_sizes"], binarize=False
             )
             
@@ -578,11 +620,11 @@ def train(args):
                 predicted_masks = [m.squeeze(0) for m in masks]
                 ground_truth_masks = gts
                 
-                loss = torch.zeros(1, dtype=predicted_masks[0].dtype, device=args.device)
+                loss = torch.zeros(1, dtype=predicted_masks[0].dtype, device=device)
 
                 for pred, gt in zip(predicted_masks, gts):
-                    gt = gt.to(args.device)
-                    loss += seg_loss(pred.squeeze(0), gt)
+                    gt = gt.to(device)
+                    loss += dice_focal(pred.squeeze(0), gt)
 
                 loss /= len(gts)
 
@@ -593,10 +635,9 @@ def train(args):
                 # compute loss
                 #predicted_masks = masks[0] #outputs.pred_masks.squeeze(1)
                 #ground_truth_masks = batch["ground_truth_mask"].float().to(device)
-                ground_truth_masks = gts.float().to(args.device)
+                ground_truth_masks = gts.float().to(device)
 
-
-                loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+                loss = dice_focal(predicted_masks, ground_truth_masks.unsqueeze(1))
                 
                 #Updated Loss
                 # Calculate focal loss and dice loss
@@ -617,42 +658,30 @@ def train(args):
         print(f'EPOCH: {epoch}')
         print(f'Mean loss: {mean(epoch_losses)}')
 
-def training_step(supermodel, model, data, gts, optimizer, scheduler, processor, device, ragged_tensors, soft_labels=None):
-    seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
+def training_step_encoder(pretrained, supermodel, model, data, targets, optimizer, scheduler, device):
+    
+    mse_loss = nn.MSELoss(reduction='mean')
     local_grad = {k: v.cpu() for k, v in model.state_dict().items()}
+
+    # with torch.no_grad():
+    #     pretrained.to(device)
+    #     pretrained = nn.DataParallel(pretrained)
+    #     targets = pretrained.module.vision_encoder(pixel_values=data["pixel_values"].to(device))
+    #     #targets = pretrained.module.get_image_embeddings(data["pixel_values"].to(device))
+    #     pretrained = pretrained.module
+    #     pretrained = pretrained.to('cpu')
+
 
     model.to(device)
     model = nn.DataParallel(model)
-
     model.train()
+
     optimizer.zero_grad()
 
     # forward pass
-    outputs = model(pixel_values=data["pixel_values"].to(device),
-                input_boxes=data["input_boxes"].to(device),
-                multimask_output=False)
+    outputs = model.module.vision_encoder(data["pixel_values"].to(device))
 
-    
-    masks = processor.image_processor.post_process_masks(
-        outputs.pred_masks, data["original_sizes"], data["reshaped_input_sizes"], binarize=False
-    )
-    
-    #data images have varying shapes (not stackable)
-    if ragged_tensors:
-        predicted_masks = [m.squeeze(0) for m in masks]
-        loss = torch.zeros(1, dtype=predicted_masks[0].dtype, device=device)
-
-        for pred, gt in zip(predicted_masks, gts):
-            gt = gt.to(device)
-            loss += seg_loss(pred.squeeze(0), soft_labels if soft_labels else gt)
-
-        loss /= len(gts)
-
-    #data images have identical shapes (hence stackable)
-    else:
-        predicted_masks = torch.stack([m.squeeze(0) for m in masks])
-        gts = gts.float().to(device)
-        loss = seg_loss(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+    loss = mse_loss(targets,outputs.last_hidden_state)
 
     # backward pass (compute gradients of parameters w.r.t. loss)
     optimizer.zero_grad()
@@ -676,22 +705,218 @@ def training_step(supermodel, model, data, gts, optimizer, scheduler, processor,
     }
     return train_metrics
 
-def single_step(args,submodel,data,gts,ragged_tensors, model_size, do_test=False):
-    trainable_params = get_trainable_parameters(submodel, args.trainable)
-    optimizer, scheduler = get_optimizer_and_scheduler(trainable_params)
+def interactive_training_step(supermodel, model, data, gts, optimizer, scheduler, processor, device, ragged_tensors, soft_labels=None, steps=4):
+    dice_focal = DiceFocalLoss(lambda_focal=0.95,lambda_dice=0.05)
+
+    local_grad = {k: v.cpu() for k, v in model.state_dict().items()}
+
+    model.to(device)
+    model = nn.DataParallel(model)
+
+    model.train()
+    optimizer.zero_grad()
+
+    #Generate embeddings once
+    image_embeddings = model.module.vision_encoder(pixel_values=data["pixel_values"].to(device))
+
+    sparse_embeddings, dense_embeddings = model.module.prompt_encoder(input_points=data["input_points"].to(device),
+                                                                      input_labels=torch.ones(len(data["input_points"])),
+                                                                      input_boxes=None,input_masks=None)
+    image_positional_embeddings = model.module.get_image_wide_positional_embeddings()
+        
+
+    # forward pass uniformly selects either box or point prompts for mask generation
+    outputs = model.module.mask_decoder(image_embeddings, image_positional_embeddings,
+                                             sparse_embeddings, dense_embeddings, 
+                                             multimask_output=False)
+
+    #post process outputs and retreive masks    
+    masks = processor.image_processor.post_process_masks(
+        outputs.pred_masks, data["original_sizes"], data["reshaped_input_sizes"], binarize=False
+    )
+    
+    #data images have varying shapes (not stackable)
+    if ragged_tensors:
+        predicted_masks = [m.squeeze(0) for m in masks]
+        loss = torch.zeros(1, dtype=predicted_masks[0].dtype, device=device)
+
+        for pred, gt in zip(predicted_masks, gts):
+            gt = gt.to(device)
+            # focal_loss = focal(pred.squeeze(0), soft_labels if soft_labels else gt)
+            # dice_loss = dice(pred.squeeze(0), soft_labels if soft_labels else gt)
+            # loss += (0.95 * focal_loss) + (0.05 * dice_loss)
+
+            loss += dice_focal(pred.squeeze(0), soft_labels if soft_labels else gt)
+
+
+        loss /= len(gts)
+
+    #data images have identical shapes (hence stackable)
+    else:
+        predicted_masks = torch.stack([m.squeeze(0) for m in masks])
+        gts = gts.float().to(device)
+        #loss = seg_loss(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+        
+        # focal_loss = focal(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+        # dice_loss = dice(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+        # loss = (0.95 * focal_loss) + (0.05 * dice_loss)
+
+        loss = dice_focal(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+
+    # backward pass (compute gradients of parameters w.r.t. loss)
+    optimizer.zero_grad()
+    loss.backward()
+    # loss.sum().backward()
+    optimizer.step()
+    scheduler.step()
+
+    model = model.module
+    model = model.to('cpu')
+
+    with torch.no_grad():
+        for k, v in model.state_dict().items():
+            local_grad[k] = local_grad[k] - v.cpu()
+
+    supermodel.apply_grad(local_grad)
+
+    train_metrics = {
+        "train_loss": loss.sum().item(),
+        "params": model.config.num_parameters,
+    }
+    return train_metrics
+
+        
+def training_step(supermodel, model, data, gts, optimizer, scheduler, processor, device, ragged_tensors, soft_labels=None, prompt='pb'):
+    
+    #seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
+    dice = DiceLoss(sigmoid=True, squared_pred=True, reduction='mean')
+    focal = FocalLoss()
+    dice_focal = DiceFocalLoss(lambda_focal=0.95,lambda_dice=0.05)
+
+        
+    local_grad = {k: v.cpu() for k, v in model.state_dict().items()}
+
+    model.to(device)
+    model = nn.DataParallel(model)
+
+    model.train()
+    optimizer.zero_grad()
+
+    #forward pass randomly selects either box or point prompts for mask generation
+    if prompt == 'pob':
+        if random.choice(['point', 'box']) == 'point':
+            outputs = model(pixel_values=data["pixel_values"].to(device),
+                        input_points=data["input_points"].to(device),
+                        multimask_output=False)
+        else:
+            outputs = model(pixel_values=data["pixel_values"].to(device),
+                        input_boxes=data["input_boxes"].to(device),
+                        multimask_output=False)
+    #forward with point and box
+    elif prompt == 'p+b':
+        outputs = model(pixel_values=data["pixel_values"].to(device),
+                        input_points=data["input_points"].to(device),
+                        input_boxes=data["input_boxes"].to(device),
+                        multimask_output=False)
+    #forward with point only
+    elif prompt == 'p':
+        outputs = model(pixel_values=data["pixel_values"].to(device),
+                        input_points=data["input_points"].to(device),
+                        multimask_output=False)
+     #forward with box only
+    elif prompt == 'b':
+        outputs = model(pixel_values=data["pixel_values"].to(device),
+                        input_boxes=data["input_boxes"].to(device),
+                        multimask_output=False)
+
+    #post process outputs and retreive masks    
+    masks = processor.image_processor.post_process_masks(
+        outputs.pred_masks, data["original_sizes"], data["reshaped_input_sizes"], binarize=False
+    )
+    
+    #data images have varying shapes (not stackable)
+    if ragged_tensors:
+        predicted_masks = [m.squeeze(0) for m in masks]
+        loss = torch.zeros(1, dtype=predicted_masks[0].dtype, device=device)
+
+        for pred, gt in zip(predicted_masks, gts):
+            gt = gt.to(device)
+            # focal_loss = focal(pred.squeeze(0), soft_labels if soft_labels else gt)
+            # dice_loss = dice(pred.squeeze(0), soft_labels if soft_labels else gt)
+            # loss += (0.95 * focal_loss) + (0.05 * dice_loss)
+
+            loss += dice(pred.squeeze(0), soft_labels.squeeze(0) if soft_labels else gt.squeeze(0))
+
+
+        loss /= len(gts)
+
+    #data images have identical shapes (hence stackable)
+    else:
+        predicted_masks = torch.stack([m.squeeze(0) for m in masks])
+        gts = gts.float().to(device)
+        #loss = seg_loss(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+        
+        # focal_loss = focal(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+        # dice_loss = dice(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+        # loss = (0.95 * focal_loss) + (0.05 * dice_loss)
+
+        loss = dice(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+
+    # backward pass (compute gradients of parameters w.r.t. loss)
+    optimizer.zero_grad()
+    loss.backward()
+    # loss.sum().backward()
+    optimizer.step()
+    scheduler.step()
+
+    model = model.module
+    model = model.to('cpu')
+
+    with torch.no_grad():
+        for k, v in model.state_dict().items():
+            local_grad[k] = local_grad[k] - v.cpu()
+
+    supermodel.apply_grad(local_grad)
+
+    train_metrics = {
+        "train_loss": loss.sum().item(),
+        "params": model.config.num_parameters,
+    }
+    return predicted_masks, train_metrics
+
+def single_step_encoder(args,submodel,data, gts, model_size, do_test=False):
+    trainable_params = get_trainable_parameters(submodel, 'e')
+    optimizer, scheduler = get_optimizer_and_scheduler(trainable_params,args.lr)
     start_train = timeit.default_timer()
-    metrics = training_step(args.supermodel, submodel, data, gts, optimizer, scheduler, 
-                                    args.processor, args.device, ragged_tensors, soft_labels=None)
+    metrics = training_step_encoder(args.pretrained, args.supermodel, submodel, data, gts, optimizer, scheduler, args.device)
     end_train = timeit.default_timer()
     if do_test:
         start_test = timeit.default_timer()
-        miou = test(submodel,args.test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=args.processor)
+        miou = test(submodel,args.test_dataloader,disable_verbose=args.no_verbose,processor=args.processor,prompt=args.test_prompt)
         end_test = timeit.default_timer()
         metrics['test_miou'] = miou
         args.logger.info(f'\t{model_size} submodel train time : {round(end_train-start_train,4)}, test time {round(end_test-start_test,4)}, metrics {metrics}')
     else:
         args.logger.info(f'\t{model_size} submodel train time : {round(end_train-start_train,4)}, metrics {metrics}')
 
+
+def single_step(args,submodel,data,gts,ragged_tensors, model_size, do_test=False):
+    trainable_params = get_trainable_parameters(submodel, args.trainable)
+    optimizer, scheduler = get_optimizer_and_scheduler(trainable_params,args.lr,args.weight_decay)
+    start_train = timeit.default_timer()
+    preds, metrics = training_step(args.supermodel, submodel, data, gts, optimizer, scheduler, 
+                                    args.processor, args.device, ragged_tensors, soft_labels=None, prompt=args.train_prompt)
+    end_train = timeit.default_timer()
+    if do_test:
+        start_test = timeit.default_timer()
+        miou = test(submodel,args.test_dataloader,disable_verbose=args.no_verbose,processor=args.processor,prompt=args.test_prompt)
+        end_test = timeit.default_timer()
+        metrics['test_miou'] = miou
+        args.logger.info(f'\t{model_size} submodel train time : {round(end_train-start_train,4)}, test time {round(end_test-start_test,4)}, metrics {metrics}')
+    else:
+        args.logger.info(f'\t{model_size} submodel train time : {round(end_train-start_train,4)}, metrics {metrics}')
+
+    return preds
 
 def train_nas(args):
     #Training loop
@@ -708,7 +933,8 @@ def train_nas(args):
                 data = {'pixel_values': torch.stack([d['pixel_values'] for d in data]),
                  'original_sizes' : torch.stack([d['original_sizes'] for d in data]),
                  'reshaped_input_sizes' : torch.stack([d['reshaped_input_sizes'] for d in data]),
-                 'input_boxes' : torch.stack([d['input_boxes'] for d in data])}
+                 'input_boxes' : torch.stack([d['input_boxes'] for d in data]),
+                 'input_points' : torch.stack([d['input_points'] for d in data])}
             
             #set to True to test the submodels after training step
             do_test = (idx == len(args.train_dataloader) - 1)
@@ -717,21 +943,41 @@ def train_nas(args):
             save_interval = len(args.train_dataloader) // args.save_interval if len(args.train_dataloader) > 10 else 1
             do_save = ((idx + 1) % save_interval == 0)
             
+            soft_preds = None
+            
             #Train largest submodel (= supernet)
-            submodel, submodel.config.num_parameters, submodel.config.arch = (
-                    copy.deepcopy(args.supermodel.model),
-                    args.supermodel.total_params,
-                    {},
-                )
-            single_step(args,submodel,data,gts,ragged_tensors,model_size='Largest',do_test=do_test)
+            if 'l' in args.sandwich:
+                submodel, submodel.config.num_parameters, submodel.config.arch = (
+                        copy.deepcopy(args.supermodel.model),
+                        args.supermodel.total_params,
+                        {},
+                    )
+                
+                if 'e' in args.trainable and 'm' in args.trainable:
+                    soft_preds = single_step(args,submodel,data,gts,ragged_tensors,model_size='Largest',do_test=do_test)
+                    # with torch.no_grad():
+                    #     if type(soft_preds) == list:
+                    #          soft_preds = [sp.clone().detach() for sp in soft_preds]
+                    #     else:
+                    #         soft_preds = soft_preds.clone().detach()
+                else:
+                    single_step_encoder(args,submodel,data, gts, model_size='Largest', do_test=do_test)
 
             #Train smallest model
-            submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.smallest_model()
-            single_step(args,submodel,data,gts,ragged_tensors,model_size='Smallest',do_test=do_test)
+            if 's' in args.sandwich:
+                submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.smallest_model()
+                if 'e' in args.trainable and 'm' in args.trainable:
+                    single_step(args,submodel,data,gts,ragged_tensors,model_size='Smallest',do_test=do_test)
+                else:
+                    single_step_encoder(args,submodel,data, gts, model_size='Smallest', do_test=do_test)
 
             #Train arbitrary medium sized model
-            submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.random_resource_aware_model()
-            single_step(args,submodel,data,gts,ragged_tensors,model_size='Medium',do_test=do_test)
+            if 'm' in args.sandwich:
+                submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.random_resource_aware_model()
+                if 'e' in args.trainable and 'm' in args.trainable:
+                    single_step(args,submodel,data,gts,ragged_tensors,model_size='Medium',do_test=do_test)
+                else:
+                    single_step_encoder(args,submodel,data, gts, model_size='Medium', do_test=do_test)
 
             # Save the supermodel state dictionary to a file
             if do_save:

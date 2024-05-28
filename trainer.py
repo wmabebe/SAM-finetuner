@@ -1,12 +1,9 @@
-import os
 from transformers import SamModel, SamConfig, SamProcessor
-from raffm import RaFFM
+from ofm import OFM
 from torch.utils.data import DataLoader, Subset
 from utility import *
 from dataset import SA1BDataset, MitoDataset
 from torch.optim import Adam
-from monai.losses import DiceCELoss
-from statistics import mean
 
 if __name__ == '__main__':
 
@@ -18,21 +15,21 @@ if __name__ == '__main__':
     print(args)
 
     # Initialize the original SAM model and processor
-    original_model = SamModel.from_pretrained("facebook/sam-vit-base").to(device)
+    original_model = SamModel.from_pretrained("facebook/sam-vit-base")
     processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
 
-    # RaFFM configuration and submodel initialization
+    # OFM configuration and submodel initialization
     elastic_config = {
         "atten_out_space": [768],
         "inter_hidden_space": [1024],
         "residual_hidden_space": [1024],
     }
-    raffm_model = RaFFM(original_model, elastic_config=elastic_config)
-    submodel, params, config = raffm_model.random_resource_aware_model()
-    submodel = submodel.to(device)  # Move submodel to GPU
+    ofm_model = OFM(original_model, elastic_config=elastic_config)
+    submodel, params, config = ofm_model.smallest_model()
 
-    print(f'Original model size : {count_parameters(original_model)}')
-    print(f'Submodel model size : {count_parameters(submodel)}')
+
+    print(f'Original model size : {count_parameters(original_model)} params : {count_parameters(original_model)}')
+    print(f'Submodel model size : {count_parameters(submodel)} params : {count_parameters(submodel)}')
 
 
     if args.dataset == 'mito':
@@ -59,23 +56,23 @@ if __name__ == '__main__':
 
     
     elif args.dataset == 'sa1b':
-        dataset = SA1BDataset('SA1B', processor=processor)
+        dataset = SA1BDataset('dataset/SA1B', processor=processor)
 
         # Apply subset for shorter training
         if args.train_subset:
             subset_dataset = Subset(dataset, indices=range(0,args.train_subset,1))
-            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, collate_fn = custom_collate_fn) #collate_fn = custom_collate_fn
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, collate_fn = sa1b_collate_fn) #collate_fn = custom_collate_fn
         
         else:
             subset_dataset = Subset(dataset, indices=range(0,10000,1))
-            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, collate_fn = custom_collate_fn)
+            train_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, collate_fn = sa1b_collate_fn)
         
         if args.test_subset:
             subset_dataset = Subset(dataset, indices=range(args.train_subset,args.train_subset + args.test_subset,1))
-            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn = custom_collate_fn) #collate_fn = custom_collate_fn
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn = sa1b_collate_fn) #collate_fn = custom_collate_fn
         else:
             subset_dataset = Subset(dataset, indices=range(10000,len(dataset),1))
-            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn = custom_collate_fn)
+            test_dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn = sa1b_collate_fn)
 
 
     print(f'trainloader : {len(train_dataloader)}')
@@ -83,10 +80,10 @@ if __name__ == '__main__':
 
     # Calculate IoUs and average IoU before training
 
-    miou = test(original_model,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
+    miou = test(original_model,test_dataloader,device=device,disable_verbose=args.no_verbose,processor=processor)
     print(f'original_model pre-train mIoU : {miou}')
     
-    miou = test(submodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
+    miou = test(submodel,test_dataloader,device=device,disable_verbose=args.no_verbose,processor=processor)
     print(f'submodel pre-train mIoU : {miou}')
 
     
@@ -124,6 +121,8 @@ if __name__ == '__main__':
     torch.save(submodel.state_dict(), "models/sa1b_submodel_checkpoint.pth")
     torch.save(config,"models/sa1b_submodel_config.pth")
 
+    #args.supermodel.save_ckpt(f'{args.log_dir}')
+
     """Inference"""
 
     # Load the model configuration
@@ -131,12 +130,12 @@ if __name__ == '__main__':
     processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
 
     # Create an instance of the model architecture with the loaded configuration
-    my_saved_submodel, total_params = raffm_model.resource_aware_model(config)
+    my_saved_submodel, total_params = ofm_model.resource_aware_model(config)
     #Update the model by loading the weights from saved file.
     my_saved_submodel.load_state_dict(torch.load("models/sa1b_submodel_checkpoint.pth"))
 
-    my_saved_submodel.to(device)
 
-    miou = test(my_saved_submodel,test_dataloader,batch_size=args.batch_size,disable_verbose=args.no_verbose,processor=processor)
+
+    miou = test(my_saved_submodel,test_dataloader,device=device, disable_verbose=args.no_verbose,processor=processor)
     print(f'submodel post-train mIoU : {miou}')
 

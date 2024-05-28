@@ -2,7 +2,7 @@ from pycocotools.coco import COCO
 import numpy as np
 import matplotlib.pyplot as plt
 import skimage.io as io
-from dataloaders import CocoDetection, MyCocoDataset
+from dataloaders import CocoDetection, MyCocoDataset, COCOSegmentation
 import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -13,18 +13,18 @@ from utility import calculate_metrics, point_grid
 from raffm import RaFFM
 
 
-
 # In my case, just added ToTensor
 def get_transform():
     custom_transforms = []
     custom_transforms.append(transforms.ToTensor())
     return transforms.Compose(custom_transforms)
 
-LIMIT = 1000
+LIMIT = 10
 N = 8
 MODEL = 'SUBMODEL'
 
 # path to your own data and coco file
+root_dir = 'datasets/coco/'
 data_dir = 'datasets/coco/val2017'
 ann_file = 'datasets/coco/annotations/instances_val2017.json'
 
@@ -32,6 +32,8 @@ ann_file = 'datasets/coco/annotations/instances_val2017.json'
 img_transform = transforms.Compose([transforms.ToTensor()])
 
 coco_dataset  = CocoDetection(data_dir,ann_file,transform=get_transform(),target_transform=None)
+
+#coco_dataset = COCOSegmentation(root_dir,'val')
 
 print(coco_dataset)
 
@@ -73,6 +75,7 @@ cats_mean, cats_max = {}, {}
 
 # Iterate till (LIMIT) through the DataLoader
 for idx, (images, targets) in enumerate(data_loader):
+
     if not targets:
         print(f'Empty targets: {targets}')
         continue

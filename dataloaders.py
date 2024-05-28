@@ -6,7 +6,8 @@ from pycocotools.coco import COCO
 import torch
 import torchvision
 
-
+from pycocotools.coco import COCO
+from pycocotools import mask
 
 import pickle
 import numpy as np
@@ -267,11 +268,10 @@ class COCOSegmentation(SegmentationDataset):
                 1, 64, 20, 63, 7, 72]
     NUM_CLASS = 21
 
-    def __init__(self, root='../datasets/coco', split='train', mode=None, transform=None, **kwargs):
+    def __init__(self, root='datasets/coco', split='train', mode=None, transform=None, **kwargs):
         super(COCOSegmentation, self).__init__(root, split, mode, transform, **kwargs)
         # lazy import pycocotools
-        from pycocotools.coco import COCO
-        from pycocotools import mask
+
         if split == 'train':
             print('train set')
             ann_file = os.path.join(root, 'annotations/instances_train2017.json')
@@ -321,7 +321,7 @@ class COCOSegmentation(SegmentationDataset):
         mask = np.zeros((h, w), dtype=np.uint8)
         coco_mask = self.coco_mask
         for instance in target:
-            rle = coco_mask.frPyObjects(instance['Segmentation'], h, w)
+            rle = coco_mask.frPyObjects(instance['segmentation'], h, w)
             m = coco_mask.decode(rle)
             cat = instance['category_id']
             if cat in self.CAT_LIST:
