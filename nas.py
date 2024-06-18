@@ -5,12 +5,14 @@ from ofm import OFM
 from torch.utils.data import DataLoader, Subset
 from utility import *
 from logger import init_logs, get_logger
-from dataset import SA1BDataset, MitoDataset #, COCOSegmentation
-from coco_dataset import COCOSegmentation
+from dataset import SA1BDataset, MitoDataset, COCOSegmentation
+#from coco_dataset import COCOSegmentation
 import timeit
 
 
 if __name__ == '__main__':
+
+    DATA_ROOT = 'datasets/' #'/dev/shm/abebe/datasets/' 
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -46,6 +48,10 @@ if __name__ == '__main__':
         "residual_hidden_space": [768,1020,1536],
     }
     ofm = OFM(original_model, elastic_config=elastic_config)
+
+    saved_supermodel = SamModel.from_pretrained("logs/2024-05-25--01:28:19.953478_dataset[sa1b]_trainable[em]_epochs[100]_lr[1e-05]_local_bs[32]")
+    ofm = OFM(saved_supermodel)
+
     args.supermodel = ofm
     args.pretrained = original_model
 
@@ -75,8 +81,8 @@ if __name__ == '__main__':
 
     
     elif args.dataset == 'sa1b':
-        train_dataset = SA1BDataset('datasets/SA1B', processor=processor, do_crop=args.crop,label='rand')
-        test_dataset = SA1BDataset('datasets/SA1B', processor=processor, do_crop=args.crop)
+        train_dataset = SA1BDataset(f'{DATA_ROOT}SA1B', processor=processor, do_crop=args.crop,label='all')
+        test_dataset = SA1BDataset(f'{DATA_ROOT}SA1B', processor=processor, do_crop=args.crop,label='all')
 
         # Apply subset for shorter training
         if args.train_subset:
@@ -122,15 +128,32 @@ if __name__ == '__main__':
     args.logger.info(f'testloader : {len(test_dataloader)} x batch_size : {args.batch_size}')
 
     # Calculate IoUs and average IoU before training
-
-    miou = test(args.supermodel.model,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
-    args.logger.info(f'supermodel pre-NAS mIoU : {miou}%')
+    
+    start_test = timeit.default_timer()
+    miou, mious, map = eval(args.supermodel.model,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    end_test = timeit.default_timer()
+    #sorted_mious, indices = torch.sort(mious)
+    #args.logger.info(f'supermodel pre-NAS IoUs: {sorted_mious}')
+    args.logger.info(f'supermodel pre-NAS mIoU : {miou}% \t time: {round(end_test - start_test,4)} seconds')
+    #save_preds(map,'Largest')
     submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.smallest_model()
-    miou = test(submodel,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
-    args.logger.info(f'smallest pre-NAS mIoU : {miou}%')
+    start_test = timeit.default_timer()
+    miou, mious, map = eval(submodel,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    end_test = timeit.default_timer()
+    #sorted_mious, indices = torch.sort(mious)
+    #args.logger.info(f'smallest pre-NAS IoUs: {sorted_mious}')
+    args.logger.info(f'smallest pre-NAS mIoU : {miou}% \t time: {round(end_test - start_test,4)} seconds')
+    #save_preds(map,'Smallest')
     submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.random_resource_aware_model()
-    miou = test(submodel,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
-    args.logger.info(f'medium pre-NAS mIoU : {miou}%')
+    start_test = timeit.default_timer()
+    miou, mious, map = eval(submodel,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    end_test = timeit.default_timer()
+    #sorted_mious, indices = torch.sort(mious)
+    #args.logger.info(f'medium pre-NAS IoUs: {sorted_mious}')
+    args.logger.info(f'medium pre-NAS mIoU : {miou}% \t time: {round(end_test - start_test,4)} seconds')
+    #save_preds(map,'Medium')
+
+    exit()
 
     args.train_dataloader = train_dataloader
     args.test_dataloader = test_dataloader

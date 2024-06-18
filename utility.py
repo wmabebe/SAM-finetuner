@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 import cv2
-import torchvision.transforms as transforms
+from pycocotools import mask as mask_utils
 import os
 import json
 import torch
@@ -21,11 +21,12 @@ from tqdm import tqdm
 import argparse
 import gc
 from statistics import mean
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 import copy
 import timeit
 from torch.utils.data.dataloader import default_collate
+import shutil
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -34,6 +35,7 @@ def get_args():
     valid_submodels = ['lsm','ls','lm','sm','m','s']
     train_prompts = ['p','b','p+b','pob']
     test_prompts = ['p','b','p+b']
+    loss_funcs = ['dice', 'dicefocal']
     parser.add_argument('--dataset', type=str, choices=valid_datasets, default='sa1b', help='Dataset (choices: {%(choices)s}, default: %(default)s).')
     parser.add_argument('--trainable', type=str, choices=valid_trainables, default='em', help='Choice of SAM modules to train (Encoder, Mask decoder, Both) (choices: {%(choices)s}, default: %(default)s).')
     parser.add_argument('--sandwich', type=str, choices=valid_submodels, default='lsm', help='Sandwich configuration: submodels to train (Largest, Smallest, Medium) (choices: {%(choices)s}, default: %(default)s).')
@@ -46,6 +48,7 @@ def get_args():
     parser.add_argument('--lr',type=float,default=1e-5,help='Learning rate.') #mito lr=1e-5
     parser.add_argument('--weight_decay',type=float,default=0,help='Weight decay.')
     parser.add_argument('--batch_size', type=int, default=2, help='Specify dataloader batch size.')
+    parser.add_argument('--loss', type=str, default='dice', choices=loss_funcs, help='Loss function')
     parser.add_argument('--no_verbose', action='store_true', help='Enable to disable verbose mode.')
     parser.add_argument('--crop', action='store_true', help='Crop SA1B images for training with larger batch sizes.')
 
@@ -97,25 +100,25 @@ def show_anns(anns):
     ax.imshow(img)
 
 
-# def show_mask(mask, ax, random_color=False):
-#     if random_color:
-#         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-#     else:
-#         color = np.array([30/255, 144/255, 255/255, 0.6])
-#     h, w = mask.shape[-2:]
-#     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-#     ax.imshow(mask_image)
-
 def show_mask(mask, ax, random_color=False):
     if random_color:
         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
     else:
-        color = np.array([30 / 255, 144 / 255, 255 / 255, 0.6])
+        color = np.array([30/255, 144/255, 255/255, 0.6])
     h, w = mask.shape[-2:]
     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
     ax.imshow(mask_image)
-    del mask
-    gc.collect()
+
+# def show_mask(mask, ax, random_color=False):
+#     if random_color:
+#         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+#     else:
+#         color = np.array([30 / 255, 144 / 255, 255 / 255, 0.6])
+#     h, w = mask.shape[-2:]
+#     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+#     ax.imshow(mask_image)
+#     del mask
+#     gc.collect()
 
 def show_masks_on_image(raw_image, masks, filename=None):
     plt.imshow(np.array(raw_image))
@@ -145,7 +148,8 @@ def show_points(coords, labels, ax, marker_size=375):
     neg_points = coords[labels==0]
     ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
     ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)   
-    
+
+
 def show_box(box, ax, label="",linecolor=[]):
     x0, y0 = box[0], box[1]
     w, h = box[2] - box[0], box[3] - box[1]
@@ -156,6 +160,50 @@ def show_box(box, ax, label="",linecolor=[]):
         label_y = y0 + 0.5 * h  # y-coordinate of the label position
         ax.text(label_x, label_y, label, fontsize=20, color='red',
                 ha='center', va='center')
+
+def save_preds(map,folder):
+    if os.path.exists(folder):
+        shutil.rmtree(folder)
+    os.makedirs(folder)
+
+    for name, (img,point_prompt,box_prompt,gts,pred,iou) in map.items():
+        fig, axes = plt.subplots(1, 2, figsize=(20, 10))
+
+        print(f'img {img.shape}')
+        print(f'point prompt {point_prompt} shape = {point_prompt.shape}')
+        print(f'box prompt {box_prompt} shape = {box_prompt.shape}')
+        print(f'gts {gts.shape}')
+        print(f'pred {pred.shape}')
+
+        # point_prompt = point_prompt.squeeze(0)
+        point_prompt = point_prompt.numpy()
+
+        box_prompt = box_prompt.squeeze(0)
+        box_prompt = box_prompt.numpy()
+
+
+
+        #Transpose image for plotting
+        img = img.transpose(1, 2, 0)
+
+        axes[0].imshow(img)
+        show_mask(gts, axes[0]) #plt.gca()
+        show_points(point_prompt, np.array([1]), axes[0])
+        show_box(box_prompt, axes[0])
+        axes[0].set_title(f'Ground truth',fontsize=18)
+
+        axes[1].imshow(img)
+        show_mask(pred, axes[1])
+        show_points(point_prompt, np.array([1]), axes[1])
+        show_box(box_prompt, axes[1])
+        axes[1].set_title(f'Prediction iou={iou}',fontsize=18)
+        
+        plt.axis('off')
+        plot_path = os.path.join(folder, f'{name}.png')
+        plt.tight_layout()
+        plt.savefig(plot_path)
+
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -190,15 +238,15 @@ def mutual_overlap(parent_mask, child_mask):
 def compute_iou(mask_pred, mask_gt):
 
     if isinstance(mask_pred, list):
-        miou = []
+        ious = []
         for pred, gt in zip(mask_pred,mask_gt):
             pred, gt = pred.cpu(), gt.cpu()
             intersection = torch.logical_and(pred, gt).sum().float()
             union = torch.logical_or(pred, gt).sum().float()
             iou = intersection / union if union > 0 else 0.0
-            miou.append(iou)
-        miou = sum(miou) / len(miou)
-        return miou.item()
+            ious.append(iou)
+        miou = sum(ious) / len(ious)
+        return miou.item(), ious
 
     elif isinstance(mask_pred, torch.Tensor):
         mask_pred = mask_pred.view(-1, mask_pred.shape[-2], mask_pred.shape[-1])
@@ -418,13 +466,17 @@ def get_prompt_grid(array_size=256, grid_size=10, batch_size=1):
    
    return input_points
 
-def get_optimizer_and_scheduler(params,lr=1e-5,weight_decay=0):
-    optimizer = Adam(
+def get_optimizer_and_scheduler(params,lr=1e-5,weight_decay=0,scheduler=None):
+    optimizer = AdamW(
         params,
         lr=lr,
         weight_decay=weight_decay,
     )
-    scheduler = LambdaLR(optimizer, lr_lambda=lambda x: max(0.1, 0.975**x))
+    lower_bound_lr = lr / 100
+    if not scheduler:
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda x: max(lower_bound_lr, 0.985**x))
+    else:
+        scheduler.optimizer = optimizer
     return optimizer, scheduler
 
 def get_trainable_parameters(model,trainable):
@@ -464,15 +516,131 @@ def none_skipper_collate(batch):
     batch = list(filter(lambda x : x is not None, batch))
     return default_collate(batch)
 
+def eval(model,dataloader,device='cuda',disable_verbose=False,processor=None, prompt='p'):
+    map = {}
+    mIoU = []
+    num_objects = 100 # Num of objects to eval on will slice and dice tensors
+    model.eval()
+    model = nn.DataParallel(model).to(device)
+    for idx,(inputs, images, labels, boxes, points) in enumerate(tqdm(dataloader, disable=disable_verbose)): 
+
+        # print(f'points.shape : {torch.tensor(points).shape}')
+
+        ignore = []
+        for i in range(len(points)):
+            # print(f'points[{i}]: {len(points[i])}')
+            if len(points[i]) < num_objects:
+                ignore.append(i)
+        
+        images = [image for idx, image in enumerate(images) if idx not in ignore]
+        labels = [label for idx, label in enumerate(labels) if idx not in ignore]
+        points = [point for idx, point in enumerate(points) if idx not in ignore]
+        boxes = [box for idx, box in enumerate(boxes) if idx not in ignore]
+            
+        # print(f'ignore : {ignore}')
+
+        # print(f'boxes : {torch.tensor(boxes).shape}') 
+        # print(f'points: {torch.tensor([points]).shape}')
+
+        data = {'pixel_values': torch.stack([d['pixel_values'] for i,d in enumerate(inputs) if i not in ignore]),
+                 'original_sizes' : torch.stack([d['original_sizes'] for i,d in enumerate(inputs) if i not in ignore]),
+                 'reshaped_input_sizes' : torch.stack([d['reshaped_input_sizes'] for i,d in enumerate(inputs) if i not in ignore]),
+                 'input_boxes' : torch.stack([d['input_boxes'][:, :num_objects, :] for i,d in enumerate(inputs) if i not in ignore]),
+                 'input_points' : torch.stack([d['input_points'][:num_objects, :, :] for i,d in enumerate(inputs) if i not in ignore]) }
+        
+        data["pixel_values"] = data["pixel_values"].squeeze(1)
+        data['original_sizes'] = data['original_sizes'].squeeze(1)
+        data['reshaped_input_sizes'] = data['reshaped_input_sizes'].squeeze(1)
+        data['input_points'] = data['input_points'].squeeze(1)
+        data['input_boxes'] = data['input_boxes'].squeeze(1)
+        
+
+        print(f'pixel_values.shape : {data["pixel_values"].shape}')
+        print(f'original_sizes.shape : {data["original_sizes"].shape}')
+        print(f'reshaped_input_sizes.shape : {data["reshaped_input_sizes"].shape}')
+        print(f'input_points.shape : {data["input_points"].shape}')
+        print(f'input_boxes.shape : {data["input_boxes"].shape}')
+        print(f'labels size: {len(labels)}')
+
+        with torch.no_grad():
+            if prompt == 'p':
+                outputs = model(pixel_values=data["pixel_values"].to(device),
+                                input_points=data["input_points"].to(device),
+                                multimask_output=True)
+            elif prompt == 'b': 
+                outputs = model(pixel_values=data["pixel_values"].to(device),
+                                input_boxes=data["input_boxes"].to(device),
+                                multimask_output=True)
+            
+            masks = processor.image_processor.post_process_masks(outputs.pred_masks.cpu(), 
+                                                                     data["original_sizes"].cpu(), 
+                                                                     data["reshaped_input_sizes"].cpu())
+            scores = outputs.iou_scores
+
+            print(f'masks : {len(masks)}')
+
+            #loop through batch (images)
+            for i, mask in enumerate(masks):
+                pts, bxs = points[i], boxes[i]
+                #loop through objects
+                for j,(pred_1, pred_2, pred_3) in enumerate(mask):
+                    gt = mask_utils.decode(labels[i][j]['segmentation'])
+                    gt = torch.from_numpy(gt)
+                    _, mious = compute_iou([pred_1, pred_2, pred_3],[gt,gt,gt])
+
+                    mIoU.append(max(mious))
+
+                    pt, bx = [pts[j]], bxs[j]
+                    print(f'pt : {pt} \t bx : {bx}')
+                    map[f'img-{i}-obj-{j}-pred-0'] = (images[i],torch.tensor(pt),torch.tensor(bx),gt,pred_1,mious[0])
+                    map[f'img-{i}-obj-{j}-pred-1'] = (images[i],torch.tensor(pt),torch.tensor(bx),gt,pred_2,mious[1])
+                    map[f'img-{i}-obj-{j}-pred-2'] = (images[i],torch.tensor(pt),torch.tensor(bx),gt,pred_3,mious[2])
+
+
+        # for idx,image in enumerate(images):
+        #     gts = labels[idx]
+        #     pts, bxs = [points[idx]], boxes[idx]
+
+        #     with torch.no_grad():
+        #         inputs = processor(image, input_points=pts, return_tensors="pt").to(device)
+        #         outputs = model(**inputs)
+        #         masks = processor.image_processor.post_process_masks(outputs.pred_masks.cpu(), 
+        #                                                              inputs["original_sizes"].cpu(), 
+        #                                                              inputs["reshaped_input_sizes"].cpu())
+        #         masks = masks.pop()
+        #         scores = outputs.iou_scores
+        #         scores = scores.squeeze(0)
+
+        #         for i,(pred_1, pred_2, pred_3) in enumerate(masks):
+        #             gt = gts[i]
+        #             gt = mask_utils.decode(gt['segmentation'])
+        #             gt = torch.from_numpy(gt)
+        #             _, mious = compute_iou([pred_1, pred_2, pred_3],[gt,gt,gt])
+
+        #             mIoU.append(max(mious))
+
+        #             # pt, bx = pts[0][i], bxs[i]
+        #             # map[f'img-{idx}-obj-{i}-pred-0'] = (image,torch.tensor(pt),torch.tensor(bx),gt,pred_1,mious[0])
+        #             # map[f'img-{idx}-obj-{i}-pred-1'] = (image,torch.tensor(pt),torch.tensor(bx),gt,pred_2,mious[1])
+        #             # map[f'img-{idx}-obj-{i}-pred-2'] = (image,torch.tensor(pt),torch.tensor(bx),gt,pred_3,mious[2])
+
+
+    model = model.module
+    model = model.to('cpu')
+    mIoU = torch.tensor(mIoU)
+    average_mIoU = torch.mean(mIoU)
+    return average_mIoU, mIoU, map
+
 #Test model performance on given dataset
 def test(model,dataloader,size=10000,device='cuda',disable_verbose=False,processor=None, prompt='b'):
     ragged_tensors = False
+    map = {}
     mIoU = []
     count = 0
     model.eval()
     model = nn.DataParallel(model)
     model = model.to(device)
-    for (data, gts) in tqdm(dataloader, disable=disable_verbose):
+    for (data, gts, imgs, bboxes, points) in tqdm(dataloader, disable=disable_verbose):
 
         # print(f'data : {data}')
         # print(f'gts : {gts}')
@@ -535,7 +703,16 @@ def test(model,dataloader,size=10000,device='cuda',disable_verbose=False,process
                 predicted_masks_binary.append(bin_mask)
 
             ground_truth_masks = gts
-            mIoU.append(compute_iou(predicted_masks_binary,ground_truth_masks))
+            miou, mious = compute_iou(predicted_masks_binary,ground_truth_masks)
+            mIoU.append(miou)
+
+            # print(f'imgs : {len(imgs)}')
+            # print(f'gts : {len(gts)}')
+            # print(f'preds : {len(predicted_masks_binary)}')
+            # print(f'mIoU : {len(mIoU)}')
+
+            for idx,iou in enumerate(mious):
+                map[iou] = (imgs[idx],points[idx],bboxes[idx],gts[idx],predicted_masks_binary[idx])
 
         else:
             #print(f'masks[0] : {masks[0].shape}')
@@ -564,7 +741,8 @@ def test(model,dataloader,size=10000,device='cuda',disable_verbose=False,process
 
             # print(f'predicted_masks_binary shape : {predicted_masks_binary.shape}')
             # print(f'ground_truth_masks shape : {ground_truth_masks.shape}')
-            mIoU.append(compute_iou(predicted_masks_binary,ground_truth_masks))
+            miou, mious = compute_iou(predicted_masks_binary,ground_truth_masks)
+            mIoU.append(miou)
 
         # Visualize masks
         # to_pil = transforms.ToPILImage()
@@ -582,7 +760,7 @@ def test(model,dataloader,size=10000,device='cuda',disable_verbose=False,process
 
     model = model.module
     model = model.to('cpu')
-    return round(sum(mIoU) / len(mIoU), 4)
+    return round(sum(mIoU) / len(mIoU), 4), mIoU, map
 
 def train(submodel, optimizer, epochs, train_dataloader, processor, device, no_verbose=True):
     #Training loop
@@ -658,18 +836,18 @@ def train(submodel, optimizer, epochs, train_dataloader, processor, device, no_v
         print(f'EPOCH: {epoch}')
         print(f'Mean loss: {mean(epoch_losses)}')
 
-def training_step_encoder(pretrained, supermodel, model, data, targets, optimizer, scheduler, device):
+def training_step_encoder(pretrained, supermodel, model, data, gts, optimizer, scheduler, device):
     
     mse_loss = nn.MSELoss(reduction='mean')
     local_grad = {k: v.cpu() for k, v in model.state_dict().items()}
 
-    # with torch.no_grad():
-    #     pretrained.to(device)
-    #     pretrained = nn.DataParallel(pretrained)
-    #     targets = pretrained.module.vision_encoder(pixel_values=data["pixel_values"].to(device))
-    #     #targets = pretrained.module.get_image_embeddings(data["pixel_values"].to(device))
-    #     pretrained = pretrained.module
-    #     pretrained = pretrained.to('cpu')
+    with torch.no_grad():
+        pretrained.to(device)
+        pretrained = nn.DataParallel(pretrained)
+        targets = pretrained.module.vision_encoder(pixel_values=data["pixel_values"].to(device))
+        targets = pretrained.module.get_image_embeddings(data["pixel_values"].to(device))
+        pretrained = pretrained.module
+        pretrained = pretrained.to('cpu')
 
 
     model.to(device)
@@ -786,12 +964,13 @@ def interactive_training_step(supermodel, model, data, gts, optimizer, scheduler
     return train_metrics
 
         
-def training_step(supermodel, model, data, gts, optimizer, scheduler, processor, device, ragged_tensors, soft_labels=None, prompt='pb'):
+def training_step(supermodel, model, data, gts, optimizer, scheduler, processor, device, ragged_tensors, soft_labels=None, prompt='pb',loss_func='dice'):
     
     #seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
-    dice = DiceLoss(sigmoid=True, squared_pred=True, reduction='mean')
-    focal = FocalLoss()
-    dice_focal = DiceFocalLoss(lambda_focal=0.95,lambda_dice=0.05)
+    if loss_func == 'dice':
+        loss_func = DiceLoss(sigmoid=True, squared_pred=True, reduction='mean')
+    elif loss_func == 'dicefocal':
+        loss_func = DiceFocalLoss(lambda_focal=0.95,lambda_dice=0.05,sigmoid=True, squared_pred=True, reduction='mean')
 
         
     local_grad = {k: v.cpu() for k, v in model.state_dict().items()}
@@ -845,7 +1024,7 @@ def training_step(supermodel, model, data, gts, optimizer, scheduler, processor,
             # dice_loss = dice(pred.squeeze(0), soft_labels if soft_labels else gt)
             # loss += (0.95 * focal_loss) + (0.05 * dice_loss)
 
-            loss += dice(pred.squeeze(0), soft_labels.squeeze(0) if soft_labels else gt.squeeze(0))
+            loss += loss_func(pred.squeeze(0), soft_labels.squeeze(0) if soft_labels else gt.squeeze(0))
 
 
         loss /= len(gts)
@@ -860,7 +1039,7 @@ def training_step(supermodel, model, data, gts, optimizer, scheduler, processor,
         # dice_loss = dice(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
         # loss = (0.95 * focal_loss) + (0.05 * dice_loss)
 
-        loss = dice(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
+        loss = loss_func(predicted_masks, soft_labels if soft_labels else gts.unsqueeze(1))
 
     # backward pass (compute gradients of parameters w.r.t. loss)
     optimizer.zero_grad()
@@ -902,10 +1081,11 @@ def single_step_encoder(args,submodel,data, gts, model_size, do_test=False):
 
 def single_step(args,submodel,data,gts,ragged_tensors, model_size, do_test=False):
     trainable_params = get_trainable_parameters(submodel, args.trainable)
-    optimizer, scheduler = get_optimizer_and_scheduler(trainable_params,args.lr,args.weight_decay)
+    optimizer, args.scheduler = get_optimizer_and_scheduler(trainable_params,args.lr,args.weight_decay, args.scheduler)
     start_train = timeit.default_timer()
-    preds, metrics = training_step(args.supermodel, submodel, data, gts, optimizer, scheduler, 
-                                    args.processor, args.device, ragged_tensors, soft_labels=None, prompt=args.train_prompt)
+    preds, metrics = training_step(args.supermodel, submodel, data, gts, optimizer, args.scheduler, 
+                                    args.processor, args.device, ragged_tensors, soft_labels=None, 
+                                    prompt=args.train_prompt, loss_func=args.loss)
     end_train = timeit.default_timer()
     if do_test:
         start_test = timeit.default_timer()
@@ -920,10 +1100,13 @@ def single_step(args,submodel,data,gts,ragged_tensors, model_size, do_test=False
 
 def train_nas(args):
     #Training loop
-    # Initialize the optimizer and the loss function
+    trainable_params = get_trainable_parameters(args.supermodel.model, args.trainable)
+    _, args.scheduler = get_optimizer_and_scheduler(trainable_params,args.lr,args.weight_decay)
     ragged_tensors = False
     for epoch in range(args.epochs):
         args.logger.info(f'EPOCH {epoch}: starts')
+        #Train encoder only halfway, then finetune end-2-end
+        #args.trainable = 'e' if epoch < args.epochs / 2 else 'em' 
         start_epoch = timeit.default_timer()
         for idx, (data, gts) in enumerate(tqdm(args.train_dataloader, disable=args.no_verbose)):
 
