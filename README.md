@@ -34,3 +34,6 @@ To maintain a structured dataset, the following commands can be used:
 ### Run finetuning code
 
 `sbatch --gres=gpu:1 --wrap="python3 finetune.py"`
+
+
+### Test
