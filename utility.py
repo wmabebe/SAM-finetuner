@@ -516,37 +516,52 @@ def none_skipper_collate(batch):
     batch = list(filter(lambda x : x is not None, batch))
     return default_collate(batch)
 
-def eval(model,dataloader,device='cuda',disable_verbose=False,processor=None, prompt='p'):
+def eval(model,dataloader,device='cuda',disable_verbose=False,processor=None, prompt='p',num_objects=100,pretrained=None):
     map = {}
     mIoU = []
-    num_objects = 100 # Num of objects to eval on will slice and dice tensors
     model.eval()
     model = nn.DataParallel(model).to(device)
+    if pretrained:
+        pretrained = pretrained.to(device)
     for idx,(inputs, images, labels, boxes, points) in enumerate(tqdm(dataloader, disable=disable_verbose)): 
 
-        # print(f'points.shape : {torch.tensor(points).shape}')
+        #If batch_size=1, set num_objects to all objects in the current data point
+        num_objects = len(points[0]) if len(points) == 1  else min([len(pts) for pts in points])
+        #Limit num_objects to 64 for reduced GPU memory usage
+        num_objects = min(64, num_objects)
 
-        ignore = []
-        for i in range(len(points)):
-            # print(f'points[{i}]: {len(points[i])}')
-            if len(points[i]) < num_objects:
-                ignore.append(i)
+        # Filter num_objects prompt indices from points and boxes
+        input_boxes, input_points = [], []
+        for i,d in enumerate(inputs):
+            indices = random.sample(range(d['input_boxes'].size(1)), num_objects)
+            input_boxes.append(d['input_boxes'][:,indices, :])
+            input_points.append(d['input_points'][indices, :, :])
+            labels[i] = [labels[i][j] for j in indices]
+        input_boxes = torch.stack(input_boxes)
+        input_points = torch.stack(input_points)
+
         
-        images = [image for idx, image in enumerate(images) if idx not in ignore]
+        ignore = []
+        # for i in range(len(points)):
+        #     # print(f'points[{i}]: {len(points[i])}')
+        #     if len(points[i]) < num_objects:
+        #         ignore.append(i)
+        
+        # images = [image for idx, image in enumerate(images) if idx not in ignore]
         labels = [label for idx, label in enumerate(labels) if idx not in ignore]
-        points = [point for idx, point in enumerate(points) if idx not in ignore]
-        boxes = [box for idx, box in enumerate(boxes) if idx not in ignore]
+        # points = [point for idx, point in enumerate(points) if idx not in ignore]
+        # boxes = [box for idx, box in enumerate(boxes) if idx not in ignore]
             
-        # print(f'ignore : {ignore}')
+        # # print(f'ignore : {ignore}')
 
-        # print(f'boxes : {torch.tensor(boxes).shape}') 
-        # print(f'points: {torch.tensor([points]).shape}')
+        # # print(f'boxes : {torch.tensor(boxes).shape}') 
+        # # print(f'points: {torch.tensor([points]).shape}')
 
         data = {'pixel_values': torch.stack([d['pixel_values'] for i,d in enumerate(inputs) if i not in ignore]),
                  'original_sizes' : torch.stack([d['original_sizes'] for i,d in enumerate(inputs) if i not in ignore]),
                  'reshaped_input_sizes' : torch.stack([d['reshaped_input_sizes'] for i,d in enumerate(inputs) if i not in ignore]),
-                 'input_boxes' : torch.stack([d['input_boxes'][:, :num_objects, :] for i,d in enumerate(inputs) if i not in ignore]),
-                 'input_points' : torch.stack([d['input_points'][:num_objects, :, :] for i,d in enumerate(inputs) if i not in ignore]) }
+                 'input_boxes' : input_boxes, #torch.stack([d['input_boxes'][:, :num_objects, :] for i,d in enumerate(inputs) if i not in ignore]),
+                 'input_points' : input_points }#torch.stack([d['input_points'][:num_objects, :, :] for i,d in enumerate(inputs) if i not in ignore]) }
         
         data["pixel_values"] = data["pixel_values"].squeeze(1)
         data['original_sizes'] = data['original_sizes'].squeeze(1)
@@ -555,27 +570,41 @@ def eval(model,dataloader,device='cuda',disable_verbose=False,processor=None, pr
         data['input_boxes'] = data['input_boxes'].squeeze(1)
         
 
-        print(f'pixel_values.shape : {data["pixel_values"].shape}')
-        print(f'original_sizes.shape : {data["original_sizes"].shape}')
-        print(f'reshaped_input_sizes.shape : {data["reshaped_input_sizes"].shape}')
-        print(f'input_points.shape : {data["input_points"].shape}')
-        print(f'input_boxes.shape : {data["input_boxes"].shape}')
-        print(f'labels size: {len(labels)}')
+        # print(f'pixel_values.shape : {data["pixel_values"].shape}')
+        # print(f'original_sizes.shape : {data["original_sizes"].shape}')
+        # print(f'reshaped_input_sizes.shape : {data["reshaped_input_sizes"].shape}')
+        # print(f'input_points.shape : {data["input_points"].shape}')
+        # print(f'input_boxes.shape : {data["input_boxes"].shape}')
+        # print(f'labels size: {len(labels)}')
 
         with torch.no_grad():
             if prompt == 'p':
                 outputs = model(pixel_values=data["pixel_values"].to(device),
                                 input_points=data["input_points"].to(device),
                                 multimask_output=True)
+                if pretrained:
+                    outputs_pretrained = pretrained(pixel_values=data["pixel_values"].to(device),
+                                input_points=data["input_points"].to(device),
+                                multimask_output=False)
             elif prompt == 'b': 
                 outputs = model(pixel_values=data["pixel_values"].to(device),
                                 input_boxes=data["input_boxes"].to(device),
                                 multimask_output=True)
+                if pretrained:
+                    outputs_pretrained = pretrained(pixel_values=data["pixel_values"].to(device),
+                                input_boxes=data["input_boxes"].to(device),
+                                multimask_output=False)
             
             masks = processor.image_processor.post_process_masks(outputs.pred_masks.cpu(), 
                                                                      data["original_sizes"].cpu(), 
                                                                      data["reshaped_input_sizes"].cpu())
             scores = outputs.iou_scores
+
+            if pretrained:
+                golden = processor.image_processor.post_process_masks(outputs_pretrained.pred_masks.cpu(), 
+                                                                     data["original_sizes"].cpu(), 
+                                                                     data["reshaped_input_sizes"].cpu())
+
 
             print(f'masks : {len(masks)}')
 
@@ -584,46 +613,26 @@ def eval(model,dataloader,device='cuda',disable_verbose=False,processor=None, pr
                 pts, bxs = points[i], boxes[i]
                 #loop through objects
                 for j,(pred_1, pred_2, pred_3) in enumerate(mask):
-                    gt = mask_utils.decode(labels[i][j]['segmentation'])
-                    gt = torch.from_numpy(gt)
-                    _, mious = compute_iou([pred_1, pred_2, pred_3],[gt,gt,gt])
+                    if pretrained:
+                        print(f'\tpred_1.shape : {pred_1.shape}')
+                        print(f'\tgolden[{i}].shape : {golden[i].shape}')
+                        print(f'\tgolden[{i}][{j}].shape : {golden[i][j].shape}')
+                        
+                        _, mious = compute_iou([pred_1, pred_2, pred_3],[golden[i][j],golden[i][j],golden[i][j]])
+                        mIoU.append(max(mious))
 
-                    mIoU.append(max(mious))
+                    else:
+                        gt = mask_utils.decode(labels[i][j]['segmentation'])
+                        gt = torch.from_numpy(gt)
+                        _, mious = compute_iou([pred_1, pred_2, pred_3],[gt,gt,gt])
 
-                    pt, bx = [pts[j]], bxs[j]
-                    print(f'pt : {pt} \t bx : {bx}')
-                    map[f'img-{i}-obj-{j}-pred-0'] = (images[i],torch.tensor(pt),torch.tensor(bx),gt,pred_1,mious[0])
-                    map[f'img-{i}-obj-{j}-pred-1'] = (images[i],torch.tensor(pt),torch.tensor(bx),gt,pred_2,mious[1])
-                    map[f'img-{i}-obj-{j}-pred-2'] = (images[i],torch.tensor(pt),torch.tensor(bx),gt,pred_3,mious[2])
+                        mIoU.append(max(mious))
 
-
-        # for idx,image in enumerate(images):
-        #     gts = labels[idx]
-        #     pts, bxs = [points[idx]], boxes[idx]
-
-        #     with torch.no_grad():
-        #         inputs = processor(image, input_points=pts, return_tensors="pt").to(device)
-        #         outputs = model(**inputs)
-        #         masks = processor.image_processor.post_process_masks(outputs.pred_masks.cpu(), 
-        #                                                              inputs["original_sizes"].cpu(), 
-        #                                                              inputs["reshaped_input_sizes"].cpu())
-        #         masks = masks.pop()
-        #         scores = outputs.iou_scores
-        #         scores = scores.squeeze(0)
-
-        #         for i,(pred_1, pred_2, pred_3) in enumerate(masks):
-        #             gt = gts[i]
-        #             gt = mask_utils.decode(gt['segmentation'])
-        #             gt = torch.from_numpy(gt)
-        #             _, mious = compute_iou([pred_1, pred_2, pred_3],[gt,gt,gt])
-
-        #             mIoU.append(max(mious))
-
-        #             # pt, bx = pts[0][i], bxs[i]
-        #             # map[f'img-{idx}-obj-{i}-pred-0'] = (image,torch.tensor(pt),torch.tensor(bx),gt,pred_1,mious[0])
-        #             # map[f'img-{idx}-obj-{i}-pred-1'] = (image,torch.tensor(pt),torch.tensor(bx),gt,pred_2,mious[1])
-        #             # map[f'img-{idx}-obj-{i}-pred-2'] = (image,torch.tensor(pt),torch.tensor(bx),gt,pred_3,mious[2])
-
+                    # pt, bx = [pts[j]], bxs[j]
+                    # print(f'pt : {pt} \t bx : {bx}')
+                    # map[f'img-{i}-obj-{j}-pred-0'] = (images[i],torch.tensor(pt),torch.tensor(bx),gt,pred_1,mious[0])
+                    # map[f'img-{i}-obj-{j}-pred-1'] = (images[i],torch.tensor(pt),torch.tensor(bx),gt,pred_2,mious[1])
+                    # map[f'img-{i}-obj-{j}-pred-2'] = (images[i],torch.tensor(pt),torch.tensor(bx),gt,pred_3,mious[2])
 
     model = model.module
     model = model.to('cpu')

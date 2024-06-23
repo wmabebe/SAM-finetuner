@@ -8,6 +8,7 @@ from logger import init_logs, get_logger
 from dataset import SA1BDataset, MitoDataset, COCOSegmentation
 #from coco_dataset import COCOSegmentation
 import timeit
+from SA1B_NAS_Trainer import SA1B_NAS_Trainer
 
 
 if __name__ == '__main__':
@@ -49,8 +50,8 @@ if __name__ == '__main__':
     }
     ofm = OFM(original_model, elastic_config=elastic_config)
 
-    saved_supermodel = SamModel.from_pretrained("logs/2024-05-25--01:28:19.953478_dataset[sa1b]_trainable[em]_epochs[100]_lr[1e-05]_local_bs[32]")
-    ofm = OFM(saved_supermodel)
+    # saved_supermodel = SamModel.from_pretrained("logs/2024-05-25--01:28:19.953478_dataset[sa1b]_trainable[em]_epochs[100]_lr[1e-05]_local_bs[32]")
+    # ofm = OFM(saved_supermodel)
 
     args.supermodel = ofm
     args.pretrained = original_model
@@ -127,18 +128,36 @@ if __name__ == '__main__':
     args.logger.info(f'trainloader : {len(train_dataloader)} x batch_size : {args.batch_size}')
     args.logger.info(f'testloader : {len(test_dataloader)} x batch_size : {args.batch_size}')
 
-    # Calculate IoUs and average IoU before training
+    args.train_dataloader = train_dataloader
+    args.test_dataloader = test_dataloader
+    args.processor = processor
+    args.device = device
+    args.log_dir = log_dir
+    
+    #Initialize Trainer
+    trainer = SA1B_NAS_Trainer(args)
+
+    # # Calculate IoUs and average IoU before training
+    # start_test = timeit.default_timer()
+    # miou, mious, map = eval(original_model,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    # end_test = timeit.default_timer()
+    # #sorted_mious, indices = torch.sort(mious)
+    # #args.logger.info(f'supermodel pre-NAS IoUs: {sorted_mious}')
+    # args.logger.info(f'pre-trained model mIoU : {miou}% \t time: {round(end_test - start_test,4)} seconds')
     
     start_test = timeit.default_timer()
-    miou, mious, map = eval(args.supermodel.model,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    #miou, mious, map = eval(args.supermodel.model,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    miou, mious, map = trainer.eval(args.supermodel.model)
     end_test = timeit.default_timer()
     #sorted_mious, indices = torch.sort(mious)
     #args.logger.info(f'supermodel pre-NAS IoUs: {sorted_mious}')
     args.logger.info(f'supermodel pre-NAS mIoU : {miou}% \t time: {round(end_test - start_test,4)} seconds')
+
     #save_preds(map,'Largest')
     submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.smallest_model()
     start_test = timeit.default_timer()
-    miou, mious, map = eval(submodel,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    #miou, mious, map = eval(submodel,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    miou, mious, map = trainer.eval(submodel)
     end_test = timeit.default_timer()
     #sorted_mious, indices = torch.sort(mious)
     #args.logger.info(f'smallest pre-NAS IoUs: {sorted_mious}')
@@ -146,23 +165,18 @@ if __name__ == '__main__':
     #save_preds(map,'Smallest')
     submodel, submodel.config.num_parameters, submodel.config.arch = args.supermodel.random_resource_aware_model()
     start_test = timeit.default_timer()
-    miou, mious, map = eval(submodel,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    #miou, mious, map = eval(submodel,test_dataloader,disable_verbose=args.no_verbose,processor=processor,prompt=args.test_prompt)
+    miou, mious, map = trainer.eval(submodel)
     end_test = timeit.default_timer()
     #sorted_mious, indices = torch.sort(mious)
     #args.logger.info(f'medium pre-NAS IoUs: {sorted_mious}')
     args.logger.info(f'medium pre-NAS mIoU : {miou}% \t time: {round(end_test - start_test,4)} seconds')
     #save_preds(map,'Medium')
 
-    exit()
 
-    args.train_dataloader = train_dataloader
-    args.test_dataloader = test_dataloader
-    args.processor = processor
-    args.device = device
-    args.log_dir = log_dir
-    
     args.logger.info(f'NAS Training starts')
     start = timeit.default_timer()        
-    train_nas(args)
+    #train_nas(args)
+    trainer.train()
     end = timeit.default_timer()
     args.logger.info(f'NAS Training ends : {round(end-start,4)} seconds')    
